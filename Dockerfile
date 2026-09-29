@@ -100,6 +100,37 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     colordiff  \
     pciutils \
     cvmfs \
+    neovim \
+    emacs-nox \
+    byobu \
+    btop \
+    git-delta \
+    tealdeer \
+    yq \
+    xmlstarlet \
+    miller \
+    pigz \
+    lzop \
+    ltrace \
+    binutils \
+    cmake \
+    gfortran \
+    build-essential \
+    python3-dev \
+    pipx \
+    lftp \
+    aria2 \
+    rclone \
+    mtr-tiny \
+    socat \
+    netcat-openbsd \
+    nmap \
+    git-lfs \
+    manpages-dev \
+    cowsay \
+    fortune-mod \
+    lolcat \
+    neofetch \
     cvmfs-fuse3 \
     msmtp \
     msmtp-mta \
