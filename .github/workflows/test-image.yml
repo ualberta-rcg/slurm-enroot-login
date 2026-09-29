@@ -37,12 +37,15 @@ jobs:
           set -e
           # Deliberately simple pattern scan — zero dependencies. Extend
           # patterns as needed; anything suspicious should fail the build.
-          PATTERNS='BEGIN (RSA|EC|OPENSSH|DSA|PGP) PRIVATE KEY|
-                    ^(password|passwd|secret|token|api_key|apikey)\s*[:=]\s*\S+|
+          # Note: the certificate pattern is string-split so this file does
+          # not match its own scan.
+          CERTPAT="-----BEGIN"" CERTIFICATE-----"
+          PATTERNS="BEGIN (RSA|EC|OPENSSH|DSA|PGP) PRIVATE KEY|
+                    ^(password|passwd|secret|token|api_key|apikey)[[:space:]]*[:=][[:space:]]*\S+|
                     AKIA[0-9A-Z]{16}|
                     xox[baprs]-[0-9A-Za-z-]{10,}|
                     gh[pousr]_[A-Za-z0-9]{36,}|
-                    -----BEGIN CERTIFICATE-----'
+                    $CERTPAT"
           if grep -rInE "$PATTERNS" --exclude-dir=.git . ; then
             echo "::error::Credential-like pattern found in repo — this image is PUBLIC. Move it to runtime injection (see SECRETS.md)."
             exit 1
