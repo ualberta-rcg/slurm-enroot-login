@@ -58,13 +58,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY debs/ /tmp/debs/
 RUN cd /tmp/debs && \
     KEEP=""; \
-    for deb in slurm-smd_*_amd64.deb slurm-smd-client_*_amd64.deb; do \
+    for deb in slurm-smd_*_u2404.deb slurm-smd-client_*_u2404.deb; do \
         case "$deb" in \
             *dbgsym*|*dev*|*slurmd*|*slurmctld*|*slurmdbd*|*slurmrestd*|*sview*|*torque*|*openlava*|*doc*) continue;; \
         esac; \
         KEEP="$KEEP $deb"; \
     done; \
-    dpkg -i $KEEP 2>/dev/null || apt-get update && apt-get install -f -y; \
+    if [ -z "$KEEP" ]; then echo "ERROR: no client DEBs matched in /tmp/debs"; ls -la /tmp/debs; exit 1; fi; \
+    { dpkg -i $KEEP || { apt-get update && apt-get install -f -y; }; } && \
+    command -v srun >/dev/null || { echo "ERROR: srun missing after DEB install"; exit 1; }; \
     rm -rf /tmp/debs /var/lib/apt/lists/*
 
 # --- Entrypoint: job-environment scrub, then login shell ---
