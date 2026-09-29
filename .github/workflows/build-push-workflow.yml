@@ -13,8 +13,9 @@
 # Tags pushed: <repo>:<version> (pinned) and <repo>:latest (floating).
 #
 # Required repo configuration (Settings → Secrets and variables → Actions):
-#   vars.DOCKER_HUB_REPO   e.g. rkhoja/slurm-enroot-login
-#   vars.DOCKER_HUB_USER   e.g. rkhoja
+#   DOCKER_HUB_REPO and DOCKER_HUB_USER — as repo Variables OR Secrets
+#   (mixed is fine; each name is read from whichever location holds it):
+#     e.g. rkhoja/slurm-enroot-login and rkhoja
 #   secrets.DOCKER_HUB_TOKEN  Read/Write access token
 # =============================================================================
 name: Build and Push Login Image
