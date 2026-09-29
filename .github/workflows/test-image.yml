@@ -118,9 +118,14 @@ jobs:
               exit 1
             fi
           }
-          check "srun --version"    docker run --rm sel:test srun --version
-          check "sbatch --version"  docker run --rm sel:test sbatch --version
-          check "scontrol version"  docker run --rm sel:test scontrol version
+          # Slurm 26.05 clients require a configuration source before doing
+          # anything (configless: slurm.conf, else DNS SRV). Real deployments
+          # bind-mount the config cache; the test supplies a minimal conf.
+          printf 'ClusterName=seltest\nSlurmctldHost=localhost(127.0.0.1)\n' > test-slurm.conf
+          CONFMNT="-v $PWD/test-slurm.conf:/etc/slurm/slurm.conf:ro"
+          check "srun --version"    docker run --rm $CONFMNT sel:test srun --version
+          check "sbatch --version"  docker run --rm $CONFMNT sel:test sbatch --version
+          check "scontrol version"  docker run --rm $CONFMNT sel:test scontrol version
           check "login-shell present" docker run --rm sel:test test -x /usr/local/bin/login-shell
           # login shell (-lc): the module command comes from /etc/profile.d,
           # which non-login shells never source
