@@ -112,10 +112,14 @@ jobs:
       - name: 🐳 Smoke Test Image
         if: env.skip != 'true'
         run: |
-          docker run --rm $DOCKER_REPO:latest srun --version
-          docker run --rm $DOCKER_REPO:latest sbatch --version
+          # Slurm 26.05 clients need a config source before any operation;
+          # real deployments bind-mount the configless cache, tests supply one.
+          printf 'ClusterName=seltest\nSlurmctldHost=localhost(127.0.0.1)\n' > test-slurm.conf
+          CONFMNT="-v $PWD/test-slurm.conf:/etc/slurm/slurm.conf:ro"
+          docker run --rm $CONFMNT $DOCKER_REPO:latest srun --version
+          docker run --rm $CONFMNT $DOCKER_REPO:latest sbatch --version
           docker run --rm $DOCKER_REPO:latest test -x /usr/local/bin/login-shell
-          docker run --rm $DOCKER_REPO:latest bash -c 'command -v mpirun && command -v module'
+          docker run --rm $DOCKER_REPO:latest bash -lc 'command -v mpirun && command -v module'
           docker run --rm --entrypoint bash $DOCKER_REPO:latest /usr/local/bin/login-shell -c 'echo scrub-ok'
 
       - name: 🔑 Docker Hub Login
