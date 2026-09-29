@@ -173,10 +173,12 @@ RUN cd /tmp/debs && \
 # claude-code system-wide from Anthropic's signed apt repo (93-ai-agents
 # uses the same repo). codex/antigravity/opencode come from site-specific
 # installers and stay out of the portable base.
+# Official signed apt repo (docs: downloads.claude.ai; key fingerprint
+# 31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE — .asc used directly as signed-by)
 RUN mkdir -p /etc/apt/keyrings && \
-    curl -fsSL https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42a0-a8b2-6646757e4d32/apt/gpg-key.asc \
-        | gpg --dearmor -o /etc/apt/keyrings/claude-code.gpg && \
-    echo "deb [signed-by=/etc/apt/keyrings/claude-code.gpg] https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42a0-a8b2-6646757e4d32/apt stable main" \
+    curl -fsSL https://downloads.claude.ai/keys/claude-code.asc \
+        -o /etc/apt/keyrings/claude-code.asc && \
+    echo "deb [signed-by=/etc/apt/keyrings/claude-code.asc] https://downloads.claude.ai/claude-code/apt/stable stable main" \
         > /etc/apt/sources.list.d/claude-code.list && \
     apt-get update && apt-get install -y --no-install-recommends claude-code && \
     rm -rf /var/lib/apt/lists/*
