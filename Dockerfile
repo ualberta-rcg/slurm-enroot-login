@@ -61,6 +61,23 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     net-tools \
     gnupg \
     lsb-release \
+    zsh  \
+    fish  \
+    gdb  \
+    valgrind  \
+    parallel  \
+    ripgrep  \
+    fd-find  \
+    fzf  \
+    bat  \
+    ncdu  \
+    pv  \
+    zstd  \
+    p7zip-full  \
+    lz4  \
+    dos2unix  \
+    colordiff  \
+    pciutils \
     msmtp \
     msmtp-mta \
     openssl \
@@ -74,8 +91,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-venv \
     python3-psutil \
     rdma-core \
+    ibverbs-utils \
     rrdtool \
     && rm -rf /var/lib/apt/lists/*
+
+# Ubuntu names these binaries batcat/fdfind; users expect bat/fd
+RUN ln -sf /usr/bin/batcat /usr/local/bin/bat 2>/dev/null; \
+    ln -sf /usr/bin/fdfind /usr/local/bin/fd 2>/dev/null; true
 
 # --- Slurm client DEBs (staged by the workflow from warewulf-slurmd) ---
 # Keep only client-facing packages: main libs + client tools.

@@ -127,7 +127,7 @@ jobs:
         run: |
           set -o pipefail
           echo "${{ secrets.DOCKER_HUB_TOKEN }}" | docker login -u "${{ vars.DOCKER_HUB_USER }}" --password-stdin 2>&1 | tee /tmp/login.log || {
-            echo "::error::Docker Hub login failed: $(grep -viE 'password|token' /tmp/login.log | tail -n2 | tr '\n' ' ')"
+            echo "::error::Docker Hub login failed: $(grep -viE 'XXXXXXXX' /tmp/login.log | tail -n2 | tr '\n' ' ')"
             exit 1
           }
 
