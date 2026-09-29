@@ -11,6 +11,11 @@
 #
 # Triggers: push to main touching the image sources, or manual dispatch.
 # Tags pushed: <repo>:<version> (pinned) and <repo>:latest (floating).
+#
+# Required repo configuration (Settings → Secrets and variables → Actions):
+#   vars.DOCKER_HUB_REPO   e.g. rkhoja/slurm-enroot-login
+#   vars.DOCKER_HUB_USER   e.g. rkhoja
+#   secrets.DOCKER_HUB_TOKEN  Read/Write access token
 # =============================================================================
 name: Build and Push Login Image
 
