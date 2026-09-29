@@ -121,7 +121,7 @@ jobs:
           # Slurm 26.05 clients require a configuration source before doing
           # anything (configless: slurm.conf, else DNS SRV). Real deployments
           # bind-mount the config cache; the test supplies a minimal conf.
-          printf 'ClusterName=seltest\nSlurmctldHost=localhost(127.0.0.1)\n' > test-slurm.conf
+          printf 'ClusterName=seltest\nSlurmctldHost=localhost(127.0.0.1)\nPlugStackConfig=/etc/slurm/plugstack.conf\n' > test-slurm.conf
           CONFMNT="-v $PWD/test-slurm.conf:/etc/slurm/slurm.conf:ro"
           check "srun --version"    docker run --rm $CONFMNT sel:test srun --version
           check "sbatch --version"  docker run --rm $CONFMNT sel:test sbatch --version
@@ -135,4 +135,7 @@ jobs:
           # login-shell env scrub: SLURM_JOB_ID must vanish, SLURM_CONF must survive
           check "login-shell scrub" docker run --rm -e SLURM_JOB_ID=12345 -e SLURM_CONF=/run/slurm/conf --entrypoint bash sel:test \
             /usr/local/bin/login-shell -c 'test -z "${SLURM_JOB_ID:-}" && test "$SLURM_CONF" = "/run/slurm/conf" && echo scrub-ok'
+          check "pyxis registered" docker run --rm $CONFMNT sel:test bash -c 'srun --help 2>&1 | grep -c -- "--container" | grep -qv ^0'
+          check "claude installed" docker run --rm sel:test bash -c 'command -v claude'
+          check "cvmfs client" docker run --rm sel:test bash -c 'command -v cvmfs_config'
           echo "✅ All smoke tests passed (Slurm ${{ env.version }})"

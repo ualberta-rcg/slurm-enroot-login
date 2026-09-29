@@ -11,11 +11,28 @@
 #      (no slurmd/slurmctld/slurmdbd daemons, no dev, no dbgsym).
 # =============================================================================
 
+# --- Pyxis plugin builder: tools live and die here, never in the final image
+FROM ubuntu:24.04 AS pyxis-builder
+ENV DEBIAN_FRONTEND=noninteractive
+COPY debs/ /tmp/debs/
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        gcc make libc6-dev git ca-certificates && \
+    dpkg -i /tmp/debs/slurm-smd_*_u2404.deb /tmp/debs/slurm-smd-dev_*_u2404.deb 2>/dev/null || \
+        apt-get install -f -y && \
+    PYXIS_TAG=$(git ls-remote --tags https://github.com/NVIDIA/pyxis 'v*' \
+        | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1) && \
+    git clone --depth 1 --branch "$PYXIS_TAG" https://github.com/NVIDIA/pyxis /tmp/pyxis && \
+    make -C /tmp/pyxis && cp /tmp/pyxis/spank_pyxis.so /spank_pyxis.so
+
 FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
 # --- Base interactive tooling (no services, no sshd) ---
+# CVMFS client from the public CERN repo (24-install-cvmfs parity); the
+# site config (default.local, proxies) is runtime-injected, never baked.
+RUN echo "deb [trusted=yes] http://cvmrepo.s3.cern.ch/cvmrepo/apt noble-prod main" \
+        > /etc/apt/sources.list.d/cernvm.list
 RUN apt-get update && apt-get install -y --no-install-recommends \
     bash-completion \
     ca-certificates \
@@ -78,6 +95,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     dos2unix  \
     colordiff  \
     pciutils \
+    cvmfs \
+    cvmfs-fuse3 \
     msmtp \
     msmtp-mta \
     openssl \
@@ -116,11 +135,23 @@ RUN cd /tmp/debs && \
     rm -rf /tmp/debs /var/lib/apt/lists/*
 
 # --- AI agent tooling (93-ai-agents parity; public, no secrets) ---
-# claude-code via the official installer. codex/antigravity/opencode come
-# from site-specific installers and stay out of the portable base.
-RUN curl -fsSL https://claude.ai/install.sh | bash && \
-    CLAUDE_BIN=$(find /root/.local/bin /usr/local/bin -maxdepth 1 -name claude -type f 2>/dev/null | head -n1) && \
-    [ -n "$CLAUDE_BIN" ] && ln -sf "$CLAUDE_BIN" /usr/local/bin/claude || true
+# claude-code system-wide from Anthropic's signed apt repo (93-ai-agents
+# uses the same repo). codex/antigravity/opencode come from site-specific
+# installers and stay out of the portable base.
+RUN mkdir -p /etc/apt/keyrings && \
+    curl -fsSL https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42a0-a8b2-6646757e4d32/apt/gpg-key.asc \
+        | gpg --dearmor -o /etc/apt/keyrings/claude-code.gpg && \
+    echo "deb [signed-by=/etc/apt/keyrings/claude-code.gpg] https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42a0-a8b2-6646757e4d32/apt stable main" \
+        > /etc/apt/sources.list.d/claude-code.list && \
+    apt-get update && apt-get install -y --no-install-recommends claude-code && \
+    rm -rf /var/lib/apt/lists/*
+
+# --- Pyxis SPANK plugin: lets the container's own srun launch container jobs ---
+COPY --from=pyxis-builder /spank_pyxis.so /usr/lib/x86_64-linux-gnu/slurm/spank_pyxis.so
+RUN mkdir -p /etc/slurm/plugstack.d && \
+    echo "optional /usr/lib/x86_64-linux-gnu/slurm/spank_pyxis.so" \
+        > /etc/slurm/plugstack.d/pyxis.conf && \
+    echo "include /etc/slurm/plugstack.d/*" > /etc/slurm/plugstack.conf
 
 # --- Entrypoint: job-environment scrub, then login shell ---
 # Called explicitly by the gateway dispatcher:
