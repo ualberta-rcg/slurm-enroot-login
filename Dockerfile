@@ -52,6 +52,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     numactl \
     hwloc-nox \
     libmunge2 \
+    libnss-sss \
+    locales \
+    tzdata \
+    tree \
+    sysstat \
+    iotop \
+    iftop \
+    net-tools \
+    gnupg \
+    lsb-release \
     && rm -rf /var/lib/apt/lists/*
 
 # --- Slurm client DEBs (staged by the workflow from warewulf-slurmd) ---

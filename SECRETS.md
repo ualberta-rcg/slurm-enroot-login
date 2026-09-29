@@ -10,6 +10,7 @@ introduced.
 | Munge key/socket | cluster secret | bind-mount `/run/munge` (read-only) from the host into the container |
 | Slurm config (configless) | cluster config | bind-mount host's config cache `/run/slurm/conf`, or rely on `_slurmctld._tcp` DNS SRV — entrypoint preserves `SLURM_CONF` |
 | User/group resolution | site LDAP/SSSD | bind-mount `/etc/sssd` (and sssd socket) or use `nss_slurm` from the job environment |
+| CVMFS software stack (`/cvmfs`, incl. soft.computecanada.ca) | host-managed fuse mounts | bind-mount `/cvmfs` from the execution node (client + config live on the host, not here) |
 | Home / scratch / projects | per-user data | `--container-mounts` computed per user by the gateway dispatcher (own home/scratch + member-group projects only) |
 | `/tmp`, `/dev/shm` | per-job isolation | `job_container/tmpfs` (Slurm-side, not an image concern) |
 | Site motd / banner | per-cluster text | overlay or bind-mount at dispatch |
