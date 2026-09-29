@@ -28,6 +28,11 @@ on:
       - 'Dockerfile'
       - 'login-shell'
       - '.github/workflows/build-push-workflow.yml'
+  # Self-rebuild: warewulf-slurmd builds new Slurm DEBs Mondays ~02:00 UTC
+  # and its images ~03:00; we check Tuesdays and pick up whatever is newest.
+  # Skips cleanly when the version tag is already on Docker Hub.
+  schedule:
+    - cron: '23 4 * * 2'
 
 concurrency:
   group: build-push-${{ github.ref }}
@@ -81,7 +86,16 @@ jobs:
           [ -f "debs/slurm-smd_${VERSION}_amd64_u2404.deb" ] || { echo "❌ slurm-smd ${VERSION} DEB not found."; exit 1; }
           [ -f "debs/slurm-smd-client_${VERSION}_amd64_u2404.deb" ] || { echo "❌ slurm-smd-client ${VERSION} DEB not found."; exit 1; }
 
+          # Scheduled runs skip when this version is already published
+          if [ "${{ github.event_name }}" = "schedule" ] \
+             && curl -sf "https://hub.docker.com/v2/repositories/$DOCKER_REPO/tags/$VERSION" > /dev/null; then
+            echo "⏭️ Slurm $VERSION already published; nothing new. Skipping."
+            echo "skip=true" >> $GITHUB_ENV
+            exit 0
+          fi
+
       - name: 🐳 Build Image
+        if: env.skip != 'true'
         run: |
           set -o pipefail
           docker build -t $DOCKER_REPO:${{ env.version }} . 2>&1 | tee /tmp/build.log || {
@@ -91,6 +105,7 @@ jobs:
           docker tag $DOCKER_REPO:${{ env.version }} $DOCKER_REPO:latest
 
       - name: 🐳 Smoke Test Image
+        if: env.skip != 'true'
         run: |
           docker run --rm $DOCKER_REPO:latest srun --version
           docker run --rm $DOCKER_REPO:latest sbatch --version
@@ -99,10 +114,12 @@ jobs:
           docker run --rm --entrypoint bash $DOCKER_REPO:latest /usr/local/bin/login-shell -c 'echo scrub-ok'
 
       - name: 🔑 Docker Hub Login
+        if: env.skip != 'true'
         run: |
           echo "${{ secrets.DOCKER_HUB_TOKEN }}" | docker login -u "${{ vars.DOCKER_HUB_USER }}" --password-stdin
 
       - name: 🚀 Push
+        if: env.skip != 'true'
         run: |
           docker push $DOCKER_REPO:${{ env.version }}
           docker push $DOCKER_REPO:latest
