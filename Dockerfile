@@ -62,6 +62,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     net-tools \
     gnupg \
     lsb-release \
+    openssl \
+    gettext \
+    pkg-config \
+    libdbus-1-dev \
+    dnsutils \
+    traceroute \
+    iputils-ping \
+    pdsh \
+    python3-venv \
+    python3-psutil \
+    rdma-core \
+    rrdtool \
+    golang \
     && rm -rf /var/lib/apt/lists/*
 
 # --- Slurm client DEBs (staged by the workflow from warewulf-slurmd) ---
