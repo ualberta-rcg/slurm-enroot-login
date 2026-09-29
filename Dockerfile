@@ -65,6 +65,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libopenmpi-dev \
     python3 \
     python3-pip \
+    make \
+    golang \
+    libnccl2 \
+    libnccl-dev \
     numactl \
     hwloc-nox \
     libmunge2 \
