@@ -29,7 +29,7 @@ done
 export OMPI_MCA_rmaps_base_oversubscribe=1
 
 if [[ $# -gt 0 ]]; then
-    exec "$SHELL" -l "$@"
+    exec "${SHELL:-/bin/bash}" -l "$@"
 else
-    exec "$SHELL" -l
+    exec "${SHELL:-/bin/bash}" -l
 fi
