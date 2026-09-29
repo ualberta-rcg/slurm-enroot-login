@@ -51,6 +51,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     numactl \
     hwloc-nox \
+    libmunge2 \
     && rm -rf /var/lib/apt/lists/*
 
 # --- Slurm client DEBs (staged by the workflow from warewulf-slurmd) ---

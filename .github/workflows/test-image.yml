@@ -112,8 +112,9 @@ jobs:
           set -e
           check() {
             local name="$1"; shift
-            if ! "$@"; then
-              echo "::error::smoke test failed: $name"
+            local out
+            if ! out=$("$@" 2>&1); then
+              echo "::error::smoke test failed: $name — $(echo "$out" | tail -n3 | tr '\n' ' ' | cut -c1-400)"
               exit 1
             fi
           }
