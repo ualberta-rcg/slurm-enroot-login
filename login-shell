@@ -1,0 +1,35 @@
+#!/bin/bash
+# =============================================================================
+# login-shell — entrypoint for the slurm-enroot-login container
+# =============================================================================
+# Inside a Slurm job, SLURM_*/PMI*/MPI* environment variables make srun,
+# salloc and mpirun act as if they were already inside an allocation:
+#   - srun would launch a step in the login job instead of a new job
+#   - mpirun would cap itself at the login job's slot count
+# Both are wrong for an interactive login. Scrub the job environment (keeping
+# only SLURM_CONF for configless operation), then start the user's shell —
+# after which clients behave exactly as on a traditional login node.
+# The job's cgroup limits still apply regardless of environment.
+# =============================================================================
+set -u
+
+export LOGIN_JOB_ID="${SLURM_JOB_ID:-}"
+
+KEEP_CONF="${SLURM_CONF:-}"
+for v in $(compgen -e); do
+    case "$v" in
+        SLURM_*|SLURMD_*|PMI_*|PMIX_*|OMPI_*|I_MPI_*|HYDRA_*) unset "$v" ;;
+    esac
+done
+
+# Configless: keep the config-cache path so clients reach slurmctld
+[[ -n $KEEP_CONF ]] && export SLURM_CONF="$KEEP_CONF"
+
+# Small MPI smoke tests may oversubscribe the (small) login job
+export OMPI_MCA_rmaps_base_oversubscribe=1
+
+if [[ $# -gt 0 ]]; then
+    exec "$SHELL" -l "$@"
+else
+    exec "$SHELL" -l
+fi

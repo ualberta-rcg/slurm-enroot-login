@@ -1,0 +1,99 @@
+# =============================================================================
+# Login Image Test (no push)
+# =============================================================================
+# Runs on every push to main (any path) and on dispatch:
+#   1. Secret scan — this is a PUBLIC repo/image; key/credential patterns
+#      fail the build. See SECRETS.md for what belongs at runtime instead.
+#   2. Build the image with staged DEBs and smoke-test the userland:
+#      slurm clients present, login-shell scrubs the job environment.
+# =============================================================================
+name: Test Login Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      SLURM_VERSION_OVERRIDE:
+        description: 'Optional: Slurm deb version (e.g. 26.05.4-1). Leave empty for newest.'
+        required: false
+        default: ''
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  secrets-scan:
+    name: 🔍 Secrets Scan
+    runs-on: ubuntu-24.04
+    steps:
+      - name: 🛠️ Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: 🔍 Scan for credential patterns
+        run: |
+          set -e
+          # Deliberately simple pattern scan — zero dependencies. Extend
+          # patterns as needed; anything suspicious should fail the build.
+          PATTERNS='BEGIN (RSA|EC|OPENSSH|DSA|PGP) PRIVATE KEY|
+                    ^(password|passwd|secret|token|api_key|apikey)\s*[:=]\s*\S+|
+                    AKIA[0-9A-Z]{16}|
+                    xox[baprs]-[0-9A-Za-z-]{10,}|
+                    gh[pousr]_[A-Za-z0-9]{36,}|
+                    -----BEGIN CERTIFICATE-----'
+          if grep -rInE "$PATTERNS" --exclude-dir=.git . ; then
+            echo "::error::Credential-like pattern found in repo — this image is PUBLIC. Move it to runtime injection (see SECRETS.md)."
+            exit 1
+          fi
+          echo "✅ No credential patterns found."
+
+  build-test:
+    name: 🐳 Build & Smoke Test
+    runs-on: ubuntu-24.04
+    needs: secrets-scan
+    timeout-minutes: 30
+    steps:
+      - name: 🛠️ Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: 🎯 Stage DEBs
+        run: |
+          set -e
+          git clone --depth 1 https://github.com/ualberta-rcg/warewulf-slurmd /tmp/ww
+          if [ -n "${{ github.event.inputs.SLURM_VERSION_OVERRIDE }}" ]; then
+            VERSION="${{ github.event.inputs.SLURM_VERSION_OVERRIDE }}"
+          else
+            VERSION=$(ls /tmp/ww/slurm-debs/slurm-smd_*_amd64_u2404.deb \
+              | sed -E 's/.*slurm-smd_([0-9]+\.[0-9]+\.[0-9]+-[0-9]+)_amd64_u2404\.deb/\1/' \
+              | sort -V | tail -n1)
+          fi
+          [ -z "$VERSION" ] && { echo "::error::No DEB version resolved"; exit 1; }
+          echo "Testing against Slurm $VERSION"
+          mkdir -p debs
+          cp /tmp/ww/slurm-debs/*_${VERSION}_*_u2404.deb debs/
+          echo "version=$VERSION" >> $GITHUB_ENV
+
+      - name: 🐳 Build Image
+        run: |
+          set -o pipefail
+          docker build -t sel:test . 2>&1 | tee /tmp/build.log || {
+            echo "::error::build failed: $(grep -vE '^ #[0-9]+ \[|^ *[0-9]+ \||^>>>|^ ---$' /tmp/build.log | tail -n8 | tr '\n' ' ' | cut -c1-800)"
+            exit 1
+          }
+
+      - name: 🧪 Smoke Tests
+        run: |
+          set -e
+          docker run --rm sel:test srun --version
+          docker run --rm sel:test sbatch --version
+          docker run --rm sel:test scontrol version
+          docker run --rm sel:test test -x /usr/local/bin/login-shell
+          docker run --rm sel:test bash -c 'command -v mpirun >/dev/null && command -v module >/dev/null && echo tools-ok'
+          docker run --rm sel:test bash -c 'test ! -x /usr/sbin/slurmd && echo no-slurmd-ok'
+          docker run --rm sel:test bash -c 'test ! -x /usr/sbin/slurmctld && echo no-slurmctld-ok'
+          # login-shell env scrub: SLURM_JOB_ID must vanish, SLURM_CONF must survive
+          docker run --rm -e SLURM_JOB_ID=12345 -e SLURM_CONF=/run/slurm/conf --entrypoint bash sel:test \
+            /usr/local/bin/login-shell -c 'test -z "${SLURM_JOB_ID:-}" && test "$SLURM_CONF" = "/run/slurm/conf" && echo scrub-ok'
+          echo "✅ All smoke tests passed (Slurm ${{ env.version }})"

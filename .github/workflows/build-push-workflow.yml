@@ -1,0 +1,109 @@
+# =============================================================================
+# Build and Push slurm-enroot-login Image
+# =============================================================================
+# Builds the portable login userland image and pushes it to Docker Hub,
+# following the same pattern as vulcan-slurm / warewulf-slurmd:
+#   - vars.DOCKER_HUB_REPO, vars.DOCKER_HUB_USER, secrets.DOCKER_HUB_TOKEN
+#   - version derived from the DEBs (no API calls), input override wins
+#
+# Slurm client DEBs are staged from the public ualberta-rcg/warewulf-slurmd
+# repo (newest *_u2404 version) — single source of truth for Slurm builds.
+#
+# Triggers: push to main touching the image sources, or manual dispatch.
+# Tags pushed: <repo>:<version> (pinned) and <repo>:latest (floating).
+# =============================================================================
+name: Build and Push Login Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      SLURM_VERSION_OVERRIDE:
+        description: 'Optional: Slurm deb version (e.g. 26.05.4-1). Leave empty for newest in warewulf-slurmd.'
+        required: false
+        default: ''
+  push:
+    branches:
+      - main
+    paths:
+      - 'Dockerfile'
+      - 'login-shell'
+      - '.github/workflows/build-push-workflow.yml'
+
+concurrency:
+  group: build-push-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-push:
+    name: 🐳 Build & Push
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      DOCKER_REPO: ${{ vars.DOCKER_HUB_REPO }}
+    steps:
+      - name: 🛡️ Fail fast if Docker Hub configuration is missing
+        run: |
+          MISSING=""
+          [ -z "${{ vars.DOCKER_HUB_REPO }}" ] && MISSING="$MISSING vars.DOCKER_HUB_REPO"
+          [ -z "${{ vars.DOCKER_HUB_USER }}" ] && MISSING="$MISSING vars.DOCKER_HUB_USER"
+          [ -z "${{ secrets.DOCKER_HUB_TOKEN }}" ] && MISSING="$MISSING secrets.DOCKER_HUB_TOKEN"
+          if [ -n "$MISSING" ]; then
+            echo "❌ Missing repository configuration:$MISSING"
+            echo "   Set them under Settings → Secrets and variables → Actions."
+            exit 1
+          fi
+          echo "✅ Docker Hub configuration present."
+
+      - name: 🛠️ Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: 🎯 Determine Slurm Version & Stage DEBs
+        run: |
+          set -e
+          # Clone the sibling repo and take the newest u2404 DEB set —
+          # plain git, no API rate limits.
+          git clone --depth 1 https://github.com/ualberta-rcg/warewulf-slurmd /tmp/ww
+          if [ -n "${{ github.event.inputs.SLURM_VERSION_OVERRIDE }}" ]; then
+            VERSION="${{ github.event.inputs.SLURM_VERSION_OVERRIDE }}"
+            echo "✅ Using manual override: $VERSION"
+          else
+            VERSION=$(ls /tmp/ww/slurm-debs/slurm-smd_*_amd64_u2404.deb \
+              | sed -E 's/.*slurm-smd_([0-9]+\.[0-9]+\.[0-9]+-[0-9]+)_amd64_u2404\.deb/\1/' \
+              | sort -V | tail -n1)
+            [ -z "$VERSION" ] && { echo "❌ No u2404 DEBs found in warewulf-slurmd."; exit 1; }
+            echo "🔬 Newest DEB version: $VERSION"
+          fi
+          echo "version=$VERSION" >> $GITHUB_ENV
+
+          mkdir -p debs
+          cp /tmp/ww/slurm-debs/*_${VERSION}_*_u2404.deb debs/ 2>/dev/null || true
+          ls -la debs/ | head -20
+          [ -f "debs/slurm-smd_${VERSION}_amd64_u2404.deb" ] || { echo "❌ slurm-smd ${VERSION} DEB not found."; exit 1; }
+          [ -f "debs/slurm-smd-client_${VERSION}_amd64_u2404.deb" ] || { echo "❌ slurm-smd-client ${VERSION} DEB not found."; exit 1; }
+
+      - name: 🐳 Build Image
+        run: |
+          set -o pipefail
+          docker build -t $DOCKER_REPO:${{ env.version }} . 2>&1 | tee /tmp/build.log || {
+            echo "::error::build failed: $(grep -vE '^ #[0-9]+ \[|^ *[0-9]+ \||^>>>|^ ---$' /tmp/build.log | tail -n8 | tr '\n' ' ' | cut -c1-800)"
+            exit 1
+          }
+          docker tag $DOCKER_REPO:${{ env.version }} $DOCKER_REPO:latest
+
+      - name: 🐳 Smoke Test Image
+        run: |
+          docker run --rm $DOCKER_REPO:latest srun --version
+          docker run --rm $DOCKER_REPO:latest sbatch --version
+          docker run --rm $DOCKER_REPO:latest test -x /usr/local/bin/login-shell
+          docker run --rm $DOCKER_REPO:latest bash -c 'command -v mpirun && command -v module'
+          docker run --rm --entrypoint bash $DOCKER_REPO:latest /usr/local/bin/login-shell -c 'echo scrub-ok'
+
+      - name: 🔑 Docker Hub Login
+        run: |
+          echo "${{ secrets.DOCKER_HUB_TOKEN }}" | docker login -u "${{ vars.DOCKER_HUB_USER }}" --password-stdin
+
+      - name: 🚀 Push
+        run: |
+          docker push $DOCKER_REPO:${{ env.version }}
+          docker push $DOCKER_REPO:latest
+          echo "## Pushed $DOCKER_REPO:${{ env.version }} + :latest" >> $GITHUB_STEP_SUMMARY
