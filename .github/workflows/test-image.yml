@@ -35,22 +35,43 @@ jobs:
       - name: 🔍 Scan for credential patterns
         run: |
           set -e
-          # Deliberately simple pattern scan — zero dependencies. Extend
-          # patterns as needed; anything suspicious should fail the build.
-          # Note: the certificate pattern is string-split so this file does
-          # not match its own scan.
-          CERTPAT="-----BEGIN"" CERTIFICATE-----"
-          PATTERNS="BEGIN (RSA|EC|OPENSSH|DSA|PGP) PRIVATE KEY|
-                    ^(password|passwd|secret|token|api_key|apikey)[[:space:]]*[:=][[:space:]]*\S+|
-                    AKIA[0-9A-Z]{16}|
-                    xox[baprs]-[0-9A-Za-z-]{10,}|
-                    gh[pousr]_[A-Za-z0-9]{36,}|
-                    $CERTPAT"
-          if grep -rInE "$PATTERNS" --exclude-dir=.git . ; then
-            echo "::error::Credential-like pattern found in repo — this image is PUBLIC. Move it to runtime injection (see SECRETS.md)."
-            exit 1
-          fi
-          echo "✅ No credential patterns found."
+          # Deliberately simple pattern scan — zero dependencies beyond
+          # python3 (runner built-in). Extend patterns as needed; anything
+          # suspicious should fail the build. Patterns are split/constructed
+          # so this file does not match its own scan.
+          python3 - <<'PYSCAN'
+          import os, re, sys
+
+          patterns = [
+              r"BEGIN (RSA|EC|OPENSSH|DSA|PGP) PRIVATE KEY",
+              r"^(password|passwd|secret|token|api_key|apikey)\s*[:=]\s*\S+",
+              r"AKIA[0-9A-Z]{16}",
+              r"xox[baprs]-[0-9A-Za-z-]{10,}",
+              r"gh[pousr]_[A-Za-z0-9]{36,}",
+              "-----BEGIN" + " CERTIFICATE-----",
+          ]
+          regexes = [re.compile(p) for p in patterns]
+          hits = []
+          for root, dirs, files in os.walk("."):
+              dirs[:] = [d for d in dirs if d != ".git"]
+              for f in files:
+                  path = os.path.join(root, f)
+                  try:
+                      with open(path, errors="replace") as fh:
+                          for i, line in enumerate(fh, 1):
+                              for rx in regexes:
+                                  if rx.search(line):
+                                      hits.append(f"{path}:{i}: {line.strip()[:120]}")
+                                      break
+                  except (OSError, UnicodeDecodeError):
+                      pass
+          if hits:
+              for h in hits[:10]:
+                  print("MATCH:", h)
+              print("::error::Credential-like pattern found (%d hits) — this image is PUBLIC. Move it to runtime injection (see SECRETS.md)." % len(hits))
+              sys.exit(1)
+          print("No credential patterns found.")
+          PYSCAN
 
   build-test:
     name: 🐳 Build & Smoke Test
