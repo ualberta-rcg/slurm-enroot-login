@@ -48,7 +48,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libopenmpi-dev \
     python3 \
     python3-pip \
-    build-essential \
     numactl \
     hwloc-nox \
     libmunge2 \
@@ -62,6 +61,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     net-tools \
     gnupg \
     lsb-release \
+    msmtp \
+    msmtp-mta \
     openssl \
     gettext \
     pkg-config \
@@ -74,7 +75,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-psutil \
     rdma-core \
     rrdtool \
-    golang \
     && rm -rf /var/lib/apt/lists/*
 
 # --- Slurm client DEBs (staged by the workflow from warewulf-slurmd) ---
@@ -92,6 +92,13 @@ RUN cd /tmp/debs && \
     { dpkg -i $KEEP || { apt-get update && apt-get install -f -y; }; } && \
     command -v srun >/dev/null || { echo "ERROR: srun missing after DEB install"; exit 1; }; \
     rm -rf /tmp/debs /var/lib/apt/lists/*
+
+# --- AI agent tooling (93-ai-agents parity; public, no secrets) ---
+# claude-code via the official installer. codex/antigravity/opencode come
+# from site-specific installers and stay out of the portable base.
+RUN curl -fsSL https://claude.ai/install.sh | bash && \
+    CLAUDE_BIN=$(find /root/.local/bin /usr/local/bin -maxdepth 1 -name claude -type f 2>/dev/null | head -n1) && \
+    [ -n "$CLAUDE_BIN" ] && ln -sf "$CLAUDE_BIN" /usr/local/bin/claude || true
 
 # --- Entrypoint: job-environment scrub, then login shell ---
 # Called explicitly by the gateway dispatcher:
