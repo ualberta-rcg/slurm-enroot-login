@@ -110,14 +110,23 @@ jobs:
       - name: 🧪 Smoke Tests
         run: |
           set -e
-          docker run --rm sel:test srun --version
-          docker run --rm sel:test sbatch --version
-          docker run --rm sel:test scontrol version
-          docker run --rm sel:test test -x /usr/local/bin/login-shell
-          docker run --rm sel:test bash -c 'command -v mpirun >/dev/null && command -v module >/dev/null && echo tools-ok'
-          docker run --rm sel:test bash -c 'test ! -x /usr/sbin/slurmd && echo no-slurmd-ok'
-          docker run --rm sel:test bash -c 'test ! -x /usr/sbin/slurmctld && echo no-slurmctld-ok'
+          check() {
+            local name="$1"; shift
+            if ! "$@"; then
+              echo "::error::smoke test failed: $name"
+              exit 1
+            fi
+          }
+          check "srun --version"    docker run --rm sel:test srun --version
+          check "sbatch --version"  docker run --rm sel:test sbatch --version
+          check "scontrol version"  docker run --rm sel:test scontrol version
+          check "login-shell present" docker run --rm sel:test test -x /usr/local/bin/login-shell
+          # login shell (-lc): the module command comes from /etc/profile.d,
+          # which non-login shells never source
+          check "mpirun+module"     docker run --rm sel:test bash -lc 'command -v mpirun >/dev/null && command -v module >/dev/null && echo tools-ok'
+          check "no slurmd"         docker run --rm sel:test bash -c 'test ! -x /usr/sbin/slurmd && echo no-slurmd-ok'
+          check "no slurmctld"      docker run --rm sel:test bash -c 'test ! -x /usr/sbin/slurmctld && echo no-slurmctld-ok'
           # login-shell env scrub: SLURM_JOB_ID must vanish, SLURM_CONF must survive
-          docker run --rm -e SLURM_JOB_ID=12345 -e SLURM_CONF=/run/slurm/conf --entrypoint bash sel:test \
+          check "login-shell scrub" docker run --rm -e SLURM_JOB_ID=12345 -e SLURM_CONF=/run/slurm/conf --entrypoint bash sel:test \
             /usr/local/bin/login-shell -c 'test -z "${SLURM_JOB_ID:-}" && test "$SLURM_CONF" = "/run/slurm/conf" && echo scrub-ok'
           echo "✅ All smoke tests passed (Slurm ${{ env.version }})"
