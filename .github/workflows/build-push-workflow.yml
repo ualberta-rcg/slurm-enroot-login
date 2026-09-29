@@ -125,7 +125,11 @@ jobs:
       - name: 🔑 Docker Hub Login
         if: env.skip != 'true'
         run: |
-          echo "${{ secrets.DOCKER_HUB_TOKEN }}" | docker login -u "${{ vars.DOCKER_HUB_USER }}" --password-stdin
+          set -o pipefail
+          echo "${{ secrets.DOCKER_HUB_TOKEN }}" | docker login -u "${{ vars.DOCKER_HUB_USER }}" --password-stdin 2>&1 | tee /tmp/login.log || {
+            echo "::error::Docker Hub login failed: $(grep -viE 'password|token' /tmp/login.log | tail -n2 | tr '\n' ' ')"
+            exit 1
+          }
 
       - name: 🚀 Push
         if: env.skip != 'true'
