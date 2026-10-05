@@ -25,9 +25,13 @@ done
 # Configless config source: a mounted config wins; otherwise bootstrap
 # sackd so the container fetches and caches the config from slurmctld
 # itself (no dependency on the host slurmd's conf-cache).
-if [[ -n $KEEP_CONF ]]; then
-    export SLURM_CONF="$KEEP_CONF"
-elif ! command -v sacct >/dev/null 2>&1 || [[ ! -f "${SLURM_CONF:-/nonexistent}" && ! -f /etc/slurm/slurm.conf ]]; then
+if [[ -n $KEEP_CONF && -f $KEEP_CONF ]]; then
+    export SLURM_CONF="$KEEP_CONF"      # mounted/inherited config that exists here
+elif [[ -f /etc/slurm/slurm.conf ]]; then
+    unset SLURM_CONF                    # mounted config; clients find /etc/slurm
+else
+    # inherited SLURM_CONF may point at the HOST conf-cache, which does not
+    # exist in the container — bootstrap sackd instead
     export SLURM_CONF=/run/slurm/conf/slurm.conf
     mkdir -p /run/slurm/conf
     sackd -d --conf-server "${SLURM_CONF_SERVER:-slurmctld-1:6817,slurmctld-2:6817,slurmctld-3:6817}"         --conf-cache /run/slurm/conf 2>/dev/null || true
