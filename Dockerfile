@@ -28,6 +28,11 @@ FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
+# --- Fixed service UIDs (standardized across all Slurm images; SlurmUser
+# must resolve inside the container for clients to parse slurm.conf) ---
+RUN groupadd -g 999 slurm && useradd -u 999 -g 999 -M -s /usr/sbin/nologin slurm && \
+    groupadd -g 972 munge && useradd -u 972 -g 972 -M -s /usr/sbin/nologin munge
+
 # --- Base interactive tooling (no services, no sshd) ---
 # CVMFS client from the public CERN repo (24-install-cvmfs parity); the
 # site config (default.local, proxies) is runtime-injected, never baked.
@@ -152,11 +157,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Ubuntu names these binaries batcat/fdfind; users expect bat/fd
 RUN ln -sf /usr/bin/batcat /usr/local/bin/bat 2>/dev/null; \
     ln -sf /usr/bin/fdfind /usr/local/bin/fd 2>/dev/null; true
-
-# --- Fixed service UIDs (standardized across all Slurm images; SlurmUser
-# must resolve inside the container for clients to parse slurm.conf) ---
-RUN groupadd -g 999 slurm && useradd -u 999 -g 999 -M -s /usr/sbin/nologin slurm && \
-    groupadd -g 972 munge && useradd -u 972 -g 972 -M -s /usr/sbin/nologin munge
 
 # --- Slurm client DEBs (staged by the workflow from warewulf-slurmd) ---
 # Keep only client-facing packages: main libs + client tools.
