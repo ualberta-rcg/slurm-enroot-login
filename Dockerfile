@@ -153,6 +153,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN ln -sf /usr/bin/batcat /usr/local/bin/bat 2>/dev/null; \
     ln -sf /usr/bin/fdfind /usr/local/bin/fd 2>/dev/null; true
 
+# --- Fixed service UIDs (standardized across all Slurm images; SlurmUser
+# must resolve inside the container for clients to parse slurm.conf) ---
+RUN groupadd -g 999 slurm && useradd -u 999 -g 999 -M -s /usr/sbin/nologin slurm && \
+    groupadd -g 972 munge && useradd -u 972 -g 972 -M -s /usr/sbin/nologin munge
+
 # --- Slurm client DEBs (staged by the workflow from warewulf-slurmd) ---
 # Keep only client-facing packages: main libs + client tools.
 COPY debs/ /tmp/debs/
