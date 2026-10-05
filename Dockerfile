@@ -158,7 +158,7 @@ RUN ln -sf /usr/bin/batcat /usr/local/bin/bat 2>/dev/null; \
 COPY debs/ /tmp/debs/
 RUN cd /tmp/debs && \
     KEEP=""; \
-    for deb in slurm-smd_*_u2404.deb slurm-smd-client_*_u2404.deb; do \
+    for deb in slurm-smd_*_u2404.deb slurm-smd-client_*_u2404.deb slurm-smd-sackd_*_u2404.deb; do \
         case "$deb" in \
             *dbgsym*|*dev*|*slurmd*|*slurmctld*|*slurmdbd*|*slurmrestd*|*sview*|*torque*|*openlava*|*doc*) continue;; \
         esac; \

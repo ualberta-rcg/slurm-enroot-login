@@ -22,8 +22,17 @@ for v in $(compgen -e); do
     esac
 done
 
-# Configless: keep the config-cache path so clients reach slurmctld
-[[ -n $KEEP_CONF ]] && export SLURM_CONF="$KEEP_CONF"
+# Configless config source: a mounted config wins; otherwise bootstrap
+# sackd so the container fetches and caches the config from slurmctld
+# itself (no dependency on the host slurmd's conf-cache).
+if [[ -n $KEEP_CONF ]]; then
+    export SLURM_CONF="$KEEP_CONF"
+elif ! command -v sacct >/dev/null 2>&1 || [[ ! -f "${SLURM_CONF:-/nonexistent}" && ! -f /etc/slurm/slurm.conf ]]; then
+    export SLURM_CONF=/run/slurm/conf/slurm.conf
+    mkdir -p /run/slurm/conf
+    sackd -d --conf-server "${SLURM_CONF_SERVER:-slurmctld-1:6817,slurmctld-2:6817,slurmctld-3:6817}"         --conf-cache /run/slurm/conf 2>/dev/null || true
+    for i in $(seq 1 10); do [[ -f $SLURM_CONF ]] && break; sleep 1; done
+fi
 
 # Small MPI smoke tests may oversubscribe the (small) login job
 export OMPI_MCA_rmaps_base_oversubscribe=1
