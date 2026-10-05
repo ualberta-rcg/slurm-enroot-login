@@ -42,6 +42,9 @@ fi
 # Small MPI smoke tests may oversubscribe the (small) login job
 export OMPI_MCA_rmaps_base_oversubscribe=1
 
+# Land the user in their home directory, not /
+cd "${HOME:-/tmp}" 2>/dev/null || cd /tmp
+
 if [[ $# -gt 0 ]]; then
     exec "${SHELL:-/bin/bash}" -l "$@"
 else
