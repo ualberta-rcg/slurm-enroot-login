@@ -1,6 +1,16 @@
 #!/bin/bash
-# Interactive-step wrapper (Slurm InteractiveStepOptions): land users in
-# their home directory. Ships in the login image AND on nodes via the
-# warewulf slurm overlay, so it exists in both container and plain steps.
-cd "${HOME:-/tmp}" 2>/dev/null || cd /tmp
-exec "${SHELL:-/bin/bash}" -l
+# Interactive-step wrapper (Slurm InteractiveStepOptions). Runs for EVERY
+# interactive job cluster-wide, so it must be partition-aware:
+#   - login partition: land the user in $HOME with a login shell
+#     (the login-job UX)
+#   - everything else: behave exactly like the old "$SHELL" default —
+#     keep the submission cwd, no forced login shell
+case "${SLURM_JOB_PARTITION:-}" in
+    login)
+        cd "${HOME:-/tmp}" 2>/dev/null || cd /tmp
+        exec "${SHELL:-/bin/bash}" -l
+        ;;
+    *)
+        exec "${SHELL:-/bin/bash}"
+        ;;
+esac
