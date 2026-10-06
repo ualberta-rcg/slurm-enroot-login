@@ -202,5 +202,7 @@ COPY login-shell /usr/local/bin/login-shell
 COPY slurm-login-shell /usr/local/bin/slurm-login-shell
 RUN chmod 755 /usr/local/bin/login-shell /usr/local/bin/slurm-login-shell
 
-# No ENTRYPOINT/CMD: pyxis execs commands directly; keeping the image
-# ENTRYPOINT-free also keeps `docker run` friendly for CI and debugging.
+# Entrypoint: land in the login shell. Used via pyxis --container-entrypoint
+# (or docker run with no args). Explicit commands still bypass it, so CI
+# and debugging are unaffected.
+ENTRYPOINT ["/usr/local/bin/login-shell"]
