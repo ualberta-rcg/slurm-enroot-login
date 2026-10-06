@@ -11,6 +11,7 @@
 #
 # Triggers: push to main touching the image sources, or manual dispatch.
 # Tags pushed: <repo>:<version> (pinned) and <repo>:latest (floating).
+# Note: ENTRYPOINT is login-shell; smoke tests use --entrypoint overrides.
 #
 # Required repo configuration (Settings → Secrets and variables → Actions):
 #   DOCKER_HUB_REPO and DOCKER_HUB_USER — as repo Variables OR Secrets
