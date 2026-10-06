@@ -123,7 +123,7 @@ jobs:
           docker run --rm $CONFMNT --entrypoint srun $DOCKER_REPO:latest --version
           docker run --rm $CONFMNT --entrypoint sbatch $DOCKER_REPO:latest --version
           docker run --rm --entrypoint test $DOCKER_REPO:latest -x /usr/local/bin/login-shell
-          docker run --rm $DOCKER_REPO:latest bash -lc 'command -v mpirun && command -v module'
+          docker run --rm --entrypoint bash $DOCKER_REPO:latest -lc 'command -v mpirun && command -v module'
           docker run --rm --entrypoint bash $DOCKER_REPO:latest /usr/local/bin/login-shell -c 'echo scrub-ok'
 
       - name: 🔑 Docker Hub Login
