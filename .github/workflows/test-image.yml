@@ -133,8 +133,11 @@ jobs:
           check "no slurmd"         docker run --rm sel:test bash -c 'test ! -x /usr/sbin/slurmd && echo no-slurmd-ok'
           check "no slurmctld"      docker run --rm sel:test bash -c 'test ! -x /usr/sbin/slurmctld && echo no-slurmctld-ok'
           # login-shell env scrub: SLURM_JOB_ID must vanish, SLURM_CONF must survive
+          # Job vars scrubbed; SLURM_CONF preserved only when the file exists.
+          # In bare CI (no mounted config, no ctld) login-shell takes the
+          # sackd path, so SLURM_CONF becomes /run/slurm/conf/slurm.conf.
           check "login-shell scrub" docker run --rm -e SLURM_JOB_ID=12345 -e SLURM_CONF=/run/slurm/conf --entrypoint bash sel:test \
-            /usr/local/bin/login-shell -c 'test -z "${SLURM_JOB_ID:-}" && test "$SLURM_CONF" = "/run/slurm/conf" && echo scrub-ok'
+            /usr/local/bin/login-shell -c 'test -z "${SLURM_JOB_ID:-}" && test "$SLURM_CONF" = "/run/slurm/conf/slurm.conf" && echo scrub-ok'
           check "pyxis registered" docker run --rm $CONFMNT sel:test bash -c 'srun --help 2>&1 | grep -c -- "--container" | grep -qv ^0'
           check "claude installed" docker run --rm sel:test bash -c 'command -v claude'
           check "cvmfs client" docker run --rm sel:test bash -c 'command -v cvmfs_config'
