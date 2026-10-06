@@ -123,15 +123,15 @@ jobs:
           # bind-mount the config cache; the test supplies a minimal conf.
           printf 'ClusterName=seltest\nSlurmctldHost=localhost(127.0.0.1)\nPlugStackConfig=/etc/slurm/plugstack.conf\n' > test-slurm.conf
           CONFMNT="-v $PWD/test-slurm.conf:/etc/slurm/slurm.conf:ro"
-          check "srun --version"    docker run --rm $CONFMNT sel:test srun --version
-          check "sbatch --version"  docker run --rm $CONFMNT sel:test sbatch --version
-          check "scontrol version"  docker run --rm $CONFMNT sel:test scontrol version
-          check "login-shell present" docker run --rm sel:test test -x /usr/local/bin/login-shell
+          check "srun --version"    docker run --rm $CONFMNT --entrypoint srun sel:test --version
+          check "sbatch --version"  docker run --rm $CONFMNT --entrypoint sbatch sel:test --version
+          check "scontrol version"  docker run --rm $CONFMNT --entrypoint scontrol sel:test version
+          check "login-shell present" docker run --rm --entrypoint test sel:test -x /usr/local/bin/login-shell
           # login shell (-lc): the module command comes from /etc/profile.d,
           # which non-login shells never source
-          check "mpirun+module"     docker run --rm sel:test bash -lc 'command -v mpirun >/dev/null && command -v module >/dev/null && echo tools-ok'
-          check "no slurmd"         docker run --rm sel:test bash -c 'test ! -x /usr/sbin/slurmd && echo no-slurmd-ok'
-          check "no slurmctld"      docker run --rm sel:test bash -c 'test ! -x /usr/sbin/slurmctld && echo no-slurmctld-ok'
+          check "mpirun+module"     docker run --rm --entrypoint bash sel:test -lc 'command -v mpirun >/dev/null && command -v module >/dev/null && echo tools-ok'
+          check "no slurmd"         docker run --rm --entrypoint bash sel:test -c 'test ! -x /usr/sbin/slurmd && echo no-slurmd-ok'
+          check "no slurmctld"      docker run --rm --entrypoint bash sel:test -c 'test ! -x /usr/sbin/slurmctld && echo no-slurmctld-ok'
           # login-shell env scrub: SLURM_JOB_ID must vanish, SLURM_CONF must survive
           # Job vars scrubbed; SLURM_CONF preserved only when the file exists.
           # In bare CI (no mounted config, no ctld) login-shell takes the
@@ -139,6 +139,6 @@ jobs:
           check "login-shell scrub" docker run --rm -e SLURM_JOB_ID=12345 -e SLURM_CONF=/run/slurm/conf --entrypoint bash sel:test \
             /usr/local/bin/login-shell -c 'test -z "${SLURM_JOB_ID:-}" && test "$SLURM_CONF" = "/run/slurm/conf/slurm.conf" && echo scrub-ok'
           check "pyxis registered" docker run --rm $CONFMNT sel:test bash -c 'srun --help 2>&1 | grep -c -- "--container" | grep -qv ^0'
-          check "claude installed" docker run --rm sel:test bash -c 'command -v claude'
-          check "cvmfs client" docker run --rm sel:test bash -c 'command -v cvmfs_config'
+          check "claude installed" docker run --rm --entrypoint bash sel:test -c 'command -v claude'
+          check "cvmfs client" docker run --rm --entrypoint bash sel:test -c 'command -v cvmfs_config'
           echo "✅ All smoke tests passed (Slurm ${{ env.version }})"
