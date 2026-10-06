@@ -45,8 +45,13 @@ export OMPI_MCA_rmaps_base_oversubscribe=1
 # Land the user in their home directory, not /
 cd "${HOME:-/tmp}" 2>/dev/null || cd /tmp
 
-if [[ $# -gt 0 ]]; then
+# Docker-ENTRYPOINT semantics: bare invocation (or shell options like -c)
+# gets the user's login shell; a command (from pyxis --container-entrypoint
+# appending the step command) is exec'd directly.
+if [[ $# -eq 0 ]]; then
+    exec "${SHELL:-/bin/bash}" -l
+elif [[ $1 == -* ]]; then
     exec "${SHELL:-/bin/bash}" -l "$@"
 else
-    exec "${SHELL:-/bin/bash}" -l
+    exec "$@"
 fi
