@@ -199,7 +199,8 @@ RUN mkdir -p /etc/slurm/plugstack.d && \
 # Called explicitly by the gateway dispatcher:
 #   srun --container-image=... /usr/local/bin/login-shell
 COPY login-shell /usr/local/bin/login-shell
-RUN chmod 755 /usr/local/bin/login-shell
+COPY slurm-login-shell /usr/local/bin/slurm-login-shell
+RUN chmod 755 /usr/local/bin/login-shell /usr/local/bin/slurm-login-shell
 
 # No ENTRYPOINT/CMD: pyxis execs commands directly; keeping the image
 # ENTRYPOINT-free also keeps `docker run` friendly for CI and debugging.
