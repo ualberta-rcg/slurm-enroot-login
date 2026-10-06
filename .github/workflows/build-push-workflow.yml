@@ -33,6 +33,7 @@ on:
     paths:
       - 'Dockerfile'
       - 'login-shell'
+      - 'slurm-login-shell'
       - '.github/workflows/build-push-workflow.yml'
   # Self-rebuild: warewulf-slurmd builds new Slurm DEBs Mondays ~02:00 UTC
   # and its images ~03:00; we check Tuesdays and pick up whatever is newest.
