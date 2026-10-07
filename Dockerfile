@@ -211,8 +211,9 @@ RUN chmod 644 /etc/profile.d/zz-cvmfs.sh
 # The Alliance gentoo tree shadows `lesspipe` in PATH once the CVMFS stack
 # is loaded; the skel bashrc's eval of the BARE command then parses gentoo's
 # usage text ("syntax error near unexpected token newline"). Pin the call
-# to the image's own binary.
-RUN sed -i 's|eval "$(SHELL=/bin/sh lesspipe)"|eval "$(/usr/bin/lesspipe)"|' /etc/skel/.bashrc
+# to the image's own binary; keep the SHELL=/bin/sh prefix so lesspipe
+# always emits sh-syntax exports regardless of the inherited SHELL.
+RUN sed -i 's|eval "$(SHELL=/bin/sh lesspipe)"|eval "$(SHELL=/bin/sh /usr/bin/lesspipe)"|' /etc/skel/.bashrc
 
 # Entrypoint: land in the login shell. Used via pyxis --container-entrypoint
 # (or docker run with no args). Explicit commands still bypass it, so CI
