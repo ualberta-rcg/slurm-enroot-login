@@ -21,9 +21,12 @@ for v in $(compgen -e); do
     case "$v" in
         SLURM_*|SLURMD_*|PMI_*|PMIX_*|OMPI_*|I_MPI_*|HYDRA_*) unset "$v" ;;
         # Module env inherited from the submitting host shell points at a
-        # different module implementation's layout; let /etc/profile.d
-        # (env-modules or the CVMFS Lmod hook) initialize it fresh instead.
-        MODULEPATH|MODULERCFILE|MODULESHOME|LMOD_*|MODULES_*) unset "$v" ;;
+        # different module implementation's layout, and Lmod's session
+        # state (__Init_Default_Modules, _ModuleTable*) would make CC's
+        # z-20-lmod.sh skip MODULEPATH init and pretend host modules are
+        # loaded. Let /etc/profile.d (env-modules or the CVMFS Lmod hook)
+        # initialize everything fresh instead.
+        MODULEPATH*|MODULERCFILE|MODULESHOME|LMOD_*|_LMOD*|MODULES_*|_ModuleTable*|__Init_Default_Modules) unset "$v" ;;
     esac
 done
 
