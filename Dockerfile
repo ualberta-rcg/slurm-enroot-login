@@ -202,6 +202,12 @@ COPY login-shell /usr/local/bin/login-shell
 COPY slurm-login-shell /usr/local/bin/slurm-login-shell
 RUN chmod 755 /usr/local/bin/login-shell /usr/local/bin/slurm-login-shell
 
+# CVMFS module stack hook (Alliance/CC): runs after Ubuntu's
+# environment-modules profile script (zz- sorts last) and redefines
+# `module` as Lmod from /cvmfs when the repo is mounted. No-op otherwise.
+COPY zz-cvmfs.sh /etc/profile.d/zz-cvmfs.sh
+RUN chmod 644 /etc/profile.d/zz-cvmfs.sh
+
 # Entrypoint: land in the login shell. Used via pyxis --container-entrypoint
 # (or docker run with no args). Explicit commands still bypass it, so CI
 # and debugging are unaffected.

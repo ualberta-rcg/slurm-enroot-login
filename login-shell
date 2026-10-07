@@ -20,6 +20,10 @@ KEEP_CONF="${SLURM_CONF:-}"
 for v in $(compgen -e); do
     case "$v" in
         SLURM_*|SLURMD_*|PMI_*|PMIX_*|OMPI_*|I_MPI_*|HYDRA_*) unset "$v" ;;
+        # Module env inherited from the submitting host shell points at a
+        # different module implementation's layout; let /etc/profile.d
+        # (env-modules or the CVMFS Lmod hook) initialize it fresh instead.
+        MODULEPATH|MODULERCFILE|MODULESHOME|LMOD_*|MODULES_*) unset "$v" ;;
     esac
 done
 
