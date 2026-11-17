@@ -124,6 +124,16 @@ if [[ "${1:-}" == "--classify-transfer" ]]; then
     exit 1
 fi
 
+CLI_FORCE_CONTAINER="0"
+CLI_FORCE_ROBOT="0"
+while [[ "${1:-}" == --force-* ]]; do
+    case "$1" in
+        --force-container) CLI_FORCE_CONTAINER="1"; shift ;;
+        --force-robot)     CLI_FORCE_ROBOT="1"; shift ;;
+        *) break ;;
+    esac
+done
+
 TARGET_USER="${1:-}"
 if [[ -z "$TARGET_USER" || ! "$TARGET_USER" =~ ^[a-zA-Z0-9._-]+$ ]]; then
     echo "ERROR: valid target user not specified." >&2
@@ -175,7 +185,7 @@ user_in_group_list() {
 
 # ── 1. Detect Port-22 Robot Session ──────────────────────────────────────────
 SESSION_MODE="login"
-if [[ "${LOGINBOX_FORCE_ROBOT:-0}" == "1" ]]; then
+if [[ "${LOGINBOX_FORCE_ROBOT:-0}" == "1" || "$CLI_FORCE_ROBOT" == "1" ]]; then
     SESSION_MODE="robot"
 fi
 
@@ -233,8 +243,9 @@ if [[ $# -ge 2 && "${1:-}" == "-c" ]]; then
     fi
 fi
 
-# Allow explicit opt-in container entry (`ssh -t host container` or `LOGINBOX_FORCE_CONTAINER=1`)
+# Allow explicit opt-in container entry (`ssh -t host container`, `--force-container`, or `LOGINBOX_FORCE_CONTAINER=1`)
 FORCE_CONTAINER="${LOGINBOX_FORCE_CONTAINER:-0}"
+[[ "$CLI_FORCE_CONTAINER" == "1" ]] && FORCE_CONTAINER="1"
 if [[ "${1:-}" == "container" ]]; then
     FORCE_CONTAINER="1"
     shift

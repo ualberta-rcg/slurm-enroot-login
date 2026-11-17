@@ -24,6 +24,16 @@ MIN_CLUSTER_UID="${MIN_CLUSTER_UID:-10000}"
 MODE="${1:-external}"
 TARGET_USER="${2:-}"
 
+# When libnss_shim maps non-local users inside ssh.service to 'cilogon',
+# OpenSSH expands %u to pw_name ('cilogon') while setting the privileged
+# monitor proctitle (/proc/$PPID/cmdline) to 'sshd: <requested_user> [priv]'.
+if [[ "$TARGET_USER" == "cilogon" && -r "/proc/${PPID}/cmdline" ]]; then
+    PPID_CMD=$(tr '\0' ' ' < "/proc/${PPID}/cmdline" 2>/dev/null || true)
+    if [[ "$PPID_CMD" =~ ^sshd:[[:space:]]+([a-zA-Z0-9._-]+)[[:space:]]+\[priv\] ]]; then
+        TARGET_USER="${BASH_REMATCH[1]}"
+    fi
+fi
+
 if [[ -z "$TARGET_USER" || ! "$TARGET_USER" =~ ^[a-zA-Z0-9._-]+$ ]]; then
     exit 0
 fi

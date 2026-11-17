@@ -16,7 +16,7 @@ CONF_FILE="/etc/loginbox/loginbox.conf"
 TARGET_USER=""
 TARGET_NODE=""
 MODE="login"
-WAIT_TIMEOUT="${WAIT_TIMEOUT:-30}"
+WAIT_TIMEOUT="${WAIT_TIMEOUT:-60}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -89,7 +89,9 @@ LOCK_DIR="/run/loginbox/locks"
 LOG_DIR="/run/loginbox/logs"
 mkdir -p "$ROUTE_DIR" "$LOCK_DIR" "$LOG_DIR" 2>/dev/null || true
 chmod 755 /run/loginbox "$ROUTE_DIR" 2>/dev/null || true
-chmod 700 "$LOCK_DIR" "$LOG_DIR" 2>/dev/null || true
+chmod 700 "$LOCK_DIR" 2>/dev/null || true
+# 0711 allows the target UID to open its own 0600 log file while blocking directory listing
+chmod 711 "$LOG_DIR" 2>/dev/null || true
 
 ROUTE_FILE="${ROUTE_DIR}/${ROUTE_NAME}"
 LOCK_FILE="${LOCK_DIR}/${JOB_NAME}.lock"

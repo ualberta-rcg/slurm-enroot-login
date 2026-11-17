@@ -19,7 +19,7 @@ ROBOT_MEM="1G"
 ROBOT_WALLTIME="1-00:00:00"
 
 # Seconds to wait for a cold Slurm login/robot container job to become ready
-WAIT_TIMEOUT="30"
+WAIT_TIMEOUT="60"
 
 # Space-separated LDAP/POSIX groups whose members bypass container routing on
 # normal interactive/command SSH and land directly on the gateway host.
