@@ -35,6 +35,7 @@ on:
       - 'Dockerfile'
       - 'login-shell'
       - 'slurm-login-shell'
+      - 'container-sshd-entrypoint'
       - '.github/workflows/build-push-workflow.yml'
   # Self-rebuild: warewulf-slurmd builds new Slurm DEBs Mondays ~02:00 UTC
   # and its images ~03:00; we check Tuesdays and pick up whatever is newest.
@@ -123,7 +124,9 @@ jobs:
           docker run --rm $CONFMNT --entrypoint srun $DOCKER_REPO:latest --version
           docker run --rm $CONFMNT --entrypoint sbatch $DOCKER_REPO:latest --version
           docker run --rm --entrypoint test $DOCKER_REPO:latest -x /usr/local/bin/login-shell
-          docker run --rm --entrypoint bash $DOCKER_REPO:latest -lc 'command -v mpirun && command -v module'
+          docker run --rm --entrypoint test $DOCKER_REPO:latest -x /usr/local/bin/container-sshd-entrypoint
+          docker run --rm --entrypoint bash $DOCKER_REPO:latest -lc 'command -v mpirun && command -v module && command -v sshd && command -v xauth'
+          docker run --rm --entrypoint bash $DOCKER_REPO:latest -c 'ls /etc/ssh/ssh_host_* >/dev/null 2>&1 && exit 1 || exit 0'
           docker run --rm --entrypoint bash $DOCKER_REPO:latest /usr/local/bin/login-shell -c 'echo scrub-ok'
 
       - name: 🔑 Docker Hub Login

@@ -1,11 +1,15 @@
 # =============================================================================
-# Login Image Test (no push)
+# Login Image & Gateway Suite Test (no push)
 # =============================================================================
 # Runs on every push to main (any path) and on dispatch:
-#   1. Secret scan — this is a PUBLIC repo/image; key/credential patterns
-#      fail the build. See SECRETS.md for what belongs at runtime instead.
-#   2. Build the image with staged DEBs and smoke-test the userland:
-#      slurm clients present, login-shell scrubs the job environment.
+#   1. Secret + PII scan (`gateway/tests/scan_secrets_pii.py`) — this is a
+#      PUBLIC repo/image; key, credential, site IP/domain, or PII patterns fail
+#      the build. See SECRETS.md for what belongs at runtime instead.
+#   2. Shell/Python syntax checks + unit tests for the `gateway/` host suite
+#      (Port-22 Robot key filter, direct-gateway transfer classifier).
+#   3. Build the image with staged DEBs and smoke-test the userland:
+#      slurm clients, container-sshd-entrypoint, sshd, xauth, zero host keys,
+#      and login-shell environment scrubbing.
 # =============================================================================
 name: Test Login Image
 
@@ -25,58 +29,34 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  secrets-scan:
-    name: 🔍 Secrets Scan
+  secrets-and-unit-tests:
+    name: 🔍 Secrets/PII Scan & Gateway Unit Tests
     runs-on: ubuntu-24.04
     steps:
       - name: 🛠️ Checkout Repository
         uses: actions/checkout@v4
 
-      - name: 🔍 Scan for credential patterns
+      - name: 🔍 Scan for secrets, credentials, and PII
+        run: python3 gateway/tests/scan_secrets_pii.py
+
+      - name: 🧪 Syntax-check shell & Python scripts
         run: |
           set -e
-          # Deliberately simple pattern scan — zero dependencies beyond
-          # python3 (runner built-in). Extend patterns as needed; anything
-          # suspicious should fail the build. Patterns are split/constructed
-          # so this file does not match its own scan.
-          python3 - <<'PYSCAN'
-          import os, re, sys
+          bash -n login-shell slurm-login-shell container-sshd-entrypoint
+          bash -n gateway/bin/*.sh gateway/bin/enter-login-job gateway/bin/sss_ssh_authorizedkeys.filter
+          bash -n gateway/sbin/loginbox-authorized-keys
+          bash -n gateway/provisioning/*.sh gateway/provisioning/ood-oidc-user-map
+          python3 -m py_compile gateway/bin/sss_ssh_authorizedkeys.filter.py \
+                                gateway/containerssh/loginbox-webhook.py \
+                                gateway/tests/*.py
 
-          patterns = [
-              r"BEGIN (RSA|EC|OPENSSH|DSA|PGP) PRIVATE KEY",
-              r"^(password|passwd|secret|token|api_key|apikey)\s*[:=]\s*\S+",
-              r"AKIA[0-9A-Z]{16}",
-              r"xox[baprs]-[0-9A-Za-z-]{10,}",
-              r"gh[pousr]_[A-Za-z0-9]{36,}",
-              "-----BEGIN" + " CERTIFICATE-----",
-          ]
-          regexes = [re.compile(p) for p in patterns]
-          hits = []
-          for root, dirs, files in os.walk("."):
-              dirs[:] = [d for d in dirs if d != ".git"]
-              for f in files:
-                  path = os.path.join(root, f)
-                  try:
-                      with open(path, errors="replace") as fh:
-                          for i, line in enumerate(fh, 1):
-                              for rx in regexes:
-                                  if rx.search(line):
-                                      hits.append(f"{path}:{i}: {line.strip()[:120]}")
-                                      break
-                  except (OSError, UnicodeDecodeError):
-                      pass
-          if hits:
-              for h in hits[:10]:
-                  print("MATCH:", h)
-              print("::error::Credential-like pattern found (%d hits) — this image is PUBLIC. Move it to runtime injection (see SECRETS.md)." % len(hits))
-              sys.exit(1)
-          print("No credential patterns found.")
-          PYSCAN
+      - name: 🧪 Run gateway unit tests (Robot filter + Transfer classifier)
+        run: python3 -m unittest discover -v -s gateway/tests
 
   build-test:
     name: 🐳 Build & Smoke Test
     runs-on: ubuntu-24.04
-    needs: secrets-scan
+    needs: secrets-and-unit-tests
     timeout-minutes: 30
     steps:
       - name: 🛠️ Checkout Repository
@@ -118,27 +98,21 @@ jobs:
               exit 1
             fi
           }
-          # Slurm 26.05 clients require a configuration source before doing
-          # anything (configless: slurm.conf, else DNS SRV). Real deployments
-          # bind-mount the config cache; the test supplies a minimal conf.
           printf 'ClusterName=seltest\nSlurmctldHost=localhost(127.0.0.1)\nPlugStackConfig=/etc/slurm/plugstack.conf\n' > test-slurm.conf
           CONFMNT="-v $PWD/test-slurm.conf:/etc/slurm/slurm.conf:ro"
-          check "srun --version"    docker run --rm $CONFMNT --entrypoint srun sel:test --version
-          check "sbatch --version"  docker run --rm $CONFMNT --entrypoint sbatch sel:test --version
-          check "scontrol version"  docker run --rm $CONFMNT --entrypoint scontrol sel:test version
+          check "srun --version"      docker run --rm $CONFMNT --entrypoint srun sel:test --version
+          check "sbatch --version"    docker run --rm $CONFMNT --entrypoint sbatch sel:test --version
+          check "scontrol version"    docker run --rm $CONFMNT --entrypoint scontrol sel:test version
           check "login-shell present" docker run --rm --entrypoint test sel:test -x /usr/local/bin/login-shell
-          # login shell (-lc): the module command comes from /etc/profile.d,
-          # which non-login shells never source
-          check "mpirun+module"     docker run --rm --entrypoint bash sel:test -lc 'command -v mpirun >/dev/null && command -v module >/dev/null && echo tools-ok'
-          check "no slurmd"         docker run --rm --entrypoint bash sel:test -c 'test ! -x /usr/sbin/slurmd && echo no-slurmd-ok'
-          check "no slurmctld"      docker run --rm --entrypoint bash sel:test -c 'test ! -x /usr/sbin/slurmctld && echo no-slurmctld-ok'
-          # login-shell env scrub: SLURM_JOB_ID must vanish, SLURM_CONF must survive
-          # Job vars scrubbed; SLURM_CONF preserved only when the file exists.
-          # In bare CI (no mounted config, no ctld) login-shell takes the
-          # sackd path, so SLURM_CONF becomes /run/slurm/conf/slurm.conf.
-          check "login-shell scrub" docker run --rm -e SLURM_JOB_ID=12345 -e SLURM_CONF=/run/slurm/conf --entrypoint bash sel:test \
+          check "sshd-entry present"  docker run --rm --entrypoint test sel:test -x /usr/local/bin/container-sshd-entrypoint
+          check "sshd+xauth+sftp"     docker run --rm --entrypoint bash sel:test -lc 'command -v sshd >/dev/null && command -v xauth >/dev/null && test -x /usr/lib/openssh/sftp-server'
+          check "no baked hostkeys"   docker run --rm --entrypoint bash sel:test -c 'ls /etc/ssh/ssh_host_* >/dev/null 2>&1 && exit 1 || exit 0'
+          check "mpirun+module"       docker run --rm --entrypoint bash sel:test -lc 'command -v mpirun >/dev/null && command -v module >/dev/null && echo tools-ok'
+          check "no slurmd"           docker run --rm --entrypoint bash sel:test -c 'test ! -x /usr/sbin/slurmd && echo no-slurmd-ok'
+          check "no slurmctld"        docker run --rm --entrypoint bash sel:test -c 'test ! -x /usr/sbin/slurmctld && echo no-slurmctld-ok'
+          check "login-shell scrub"   docker run --rm -e SLURM_JOB_ID=12345 -e SLURM_CONF=/run/slurm/conf --entrypoint bash sel:test \
             /usr/local/bin/login-shell -c 'test -z "${SLURM_JOB_ID:-}" && test "$SLURM_CONF" = "/run/slurm/conf/slurm.conf" && echo scrub-ok'
-          check "pyxis registered" docker run --rm $CONFMNT --entrypoint bash sel:test -c 'srun --help 2>&1 | grep -c -- "--container" | grep -qv ^0'
-          check "claude installed" docker run --rm --entrypoint bash sel:test -c 'command -v claude'
-          check "cvmfs client" docker run --rm --entrypoint bash sel:test -c 'command -v cvmfs_config'
+          check "pyxis registered"    docker run --rm $CONFMNT --entrypoint bash sel:test -c 'srun --help 2>&1 | grep -c -- "--container" | grep -qv ^0'
+          check "claude installed"    docker run --rm --entrypoint bash sel:test -c 'command -v claude'
+          check "cvmfs client"        docker run --rm --entrypoint bash sel:test -c 'command -v cvmfs_config'
           echo "✅ All smoke tests passed (Slurm ${{ env.version }})"

@@ -1,0 +1,37 @@
+#!/bin/bash
+# /usr/local/bin/enter-login-job
+# Convenience helper for gateway admins (gateway-admins / ccstaff) who land
+# directly on the gateway host and want to test or enter their Slurm login
+# (or robot) container session on demand:
+#   enter-login-job            # interactive shell in login-<user>
+#   enter-login-job -c "cmd"   # run command in login-<user>
+#   enter-login-job --robot -c "cmd"
+set -euo pipefail
+
+FORCE_ROBOT="0"
+if [[ "${1:-}" == "--robot" ]]; then
+    FORCE_ROBOT="1"
+    shift
+fi
+
+CURRENT_USER=$(id -un)
+if [[ "$CURRENT_USER" == "root" && -n "${1:-}" && "${1:-}" != -* ]]; then
+    TARGET_USER="$1"
+    shift
+else
+    TARGET_USER="$CURRENT_USER"
+fi
+
+X11_COOKIE=""
+if [[ -n "${DISPLAY:-}" ]]; then
+    X11_COOKIE=$(/usr/bin/xauth list "$DISPLAY" 2>/dev/null | head -n 1 || true)
+fi
+
+exec sudo \
+    LOGINBOX_FORCE_CONTAINER="1" \
+    LOGINBOX_FORCE_ROBOT="${FORCE_ROBOT}" \
+    LOGINBOX_ORIG_DISPLAY="${DISPLAY:-}" \
+    LOGINBOX_ORIG_X11_COOKIE="${X11_COOKIE:-}" \
+    LOGINBOX_ORIG_AUTH_SOCK="${SSH_AUTH_SOCK:-}" \
+    LOGINBOX_ORIG_TERM="${TERM:-xterm-256color}" \
+    /usr/local/bin/switch-user.sh "${TARGET_USER}" "$@"

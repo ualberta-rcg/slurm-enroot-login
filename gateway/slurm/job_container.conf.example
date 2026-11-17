@@ -1,0 +1,6 @@
+# /etc/slurm/job_container.conf
+# Shared=true allows autofs / NFS mounts under /home and /cvmfs to propagate
+# cleanly into job_container/tmpfs namespaces while isolating /tmp & /dev/shm.
+AutoBasePath=true
+BasePath=/localscratch
+Shared=true

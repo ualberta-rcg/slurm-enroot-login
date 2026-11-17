@@ -1,0 +1,45 @@
+# /etc/loginbox/loginbox.conf
+# Site configuration for slurm-enroot-login SSH gateway routing.
+# Copy to /etc/loginbox/loginbox.conf on each login gateway node.
+# Never commit cluster secrets, private keys, or PII into version control.
+
+# Slurm partition and container image path (versioned filename avoids NFS ESTALE on updates)
+LOGIN_PARTITION="login"
+IMAGE_PATH="/cache/slurm-enroot-login.sqsh"
+LOGINBOX_DIR="/etc/loginbox"
+
+# Interactive user login container job sizing (login-<username>)
+LOGIN_CPUS="4"
+LOGIN_MEM="4G"
+LOGIN_WALLTIME="7-00:00:00"
+
+# Automated robot container job sizing (robot-<username> — smaller footprint)
+ROBOT_CPUS="2"
+ROBOT_MEM="1G"
+ROBOT_WALLTIME="1-00:00:00"
+
+# Seconds to wait for a cold Slurm login/robot container job to become ready
+WAIT_TIMEOUT="30"
+
+# Space-separated LDAP/POSIX groups whose members bypass container routing on
+# normal interactive/command SSH and land directly on the gateway host.
+# Supports both local cluster admin groups (e.g. gateway-admins) and Alliance ccstaff.
+GATEWAY_BYPASS_GROUPS="gateway-admins ccstaff"
+
+# LDAP/POSIX group required for non-interactive Port-22 Robot SSH keys
+ROBOT_GROUP="mfa-automation-users"
+
+# Allow restricted robot keys stored in ~/.ssh/authorized_keys in addition to
+# SSSD/LDAP sshPublicKey (useful when local OpenLDAP lacks ldapPublicKey schema)
+ALLOW_HOME_ROBOT_KEYS="1"
+
+# Minimum UID treated as a normal cluster user (system accounts below this are ignored)
+MIN_CLUSTER_UID="10000"
+
+# Comma-separated internal cluster CIDRs (OOD Web Shell, compute nodes, peer login nodes)
+INTERNAL_CIDRS="10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,127.0.0.0/8"
+
+# Per-transfer cgroup limits for direct gateway file transfers (scp / sftp / rsync / rrsync)
+XFER_MEM_MAX="512M"
+XFER_CPU_QUOTA="100%"
+XFER_TASKS_MAX="32"

@@ -1,0 +1,9 @@
+#!/usr/bin/perl
+# /usr/local/sbin/check_auth
+# PAM helper: succeeds immediately when OpenSSH has already verified a publickey.
+print "SSH_AUTH_INFO_0=$ENV{'SSH_AUTH_INFO_0'}\n";
+if ($ENV{'SSH_AUTH_INFO_0'} =~ /^publickey/) {
+    exit(0);
+} else {
+    exit(1);
+}

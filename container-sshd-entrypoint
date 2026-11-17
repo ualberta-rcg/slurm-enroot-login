@@ -1,0 +1,225 @@
+#!/bin/bash
+# =============================================================================
+# container-sshd-entrypoint — persistent non-root sshd inside a Slurm login job
+# =============================================================================
+# Runs inside the Pyxis/Enroot login container as the target unprivileged user.
+#   1. Generates ephemeral Ed25519 host key + sshd_config in /tmp/sshd (job
+#      tmpfs — zero files written to $HOME).
+#   2. Binds sshd ONLY to RFC1918 private node interfaces + 127.0.0.1 (never
+#      0.0.0.0 / public NICs).
+#   3. Scrubs SLURM_*/PMI*/MPI*/module variables so interactive shells and
+#      sbatch/srun/salloc commands inside the container allocate fresh jobs
+#      instead of nested steps, while preserving configless SLURM_CONF.
+#   4. Publishes "<node>:<port>:<sha256_fp>,<ed25519_pubkey_b64>" to the Slurm
+#      job Comment so the gateway proxy verifies the exact container host key.
+# =============================================================================
+set -euo pipefail
+
+JOB_ID="${SLURM_JOB_ID:-}"
+NODE="${SLURMD_NODENAME:-$(hostname -s)}"
+UID_NUM=$(id -u)
+USER_NAME=$(id -un)
+SESSION_MODE="${LOGINBOX_SESSION_MODE:-login}"
+
+# Resolve configless SLURM_CONF before scrubbing job environment
+KEEP_CONF="${SLURM_CONF:-}"
+RESOLVED_SLURM_CONF=""
+if [[ -n "$KEEP_CONF" && -f "$KEEP_CONF" ]]; then
+    RESOLVED_SLURM_CONF="$KEEP_CONF"
+elif [[ -f /etc/slurm/slurm.conf ]]; then
+    RESOLVED_SLURM_CONF=""
+else
+    RESOLVED_SLURM_CONF="/run/slurm/conf/slurm.conf"
+    mkdir -p /run/slurm/conf 2>/dev/null || true
+    sackd -d --conf-server "${SLURM_CONF_SERVER:-slurmctld-1:6817,slurmctld-2:6817,slurmctld-3:6817}" \
+        --conf-cache /run/slurm/conf 2>/dev/null || true
+    for _ in $(seq 1 10); do
+        [[ -f "$RESOLVED_SLURM_CONF" ]] && break
+        sleep 1
+    done
+fi
+
+SSHD_DIR="/tmp/sshd"
+rm -rf "$SSHD_DIR"
+mkdir -p "$SSHD_DIR"
+chmod 700 "$SSHD_DIR"
+
+# 1. Generate ephemeral Ed25519 host key in job tmpfs (<5 ms)
+ssh-keygen -q -t ed25519 -f "${SSHD_DIR}/ssh_host_ed25519_key" -N "" -C "${SESSION_MODE}-${USER_NAME}@${NODE}"
+chmod 600 "${SSHD_DIR}/ssh_host_ed25519_key"
+chmod 644 "${SSHD_DIR}/ssh_host_ed25519_key.pub"
+
+# 2. Install host proxy public key into /tmp/sshd/authorized_keys
+PROXY_PUBKEY=""
+for candidate_key in \
+    "${LOGINBOX_PROXY_PUBKEY:-}" \
+    "/etc/loginbox/proxy_id_ed25519.pub" \
+    "/loginbox-poc/proxy_id_ed25519.pub"; do
+    if [[ -n "$candidate_key" && -r "$candidate_key" ]]; then
+        PROXY_PUBKEY="$candidate_key"
+        break
+    fi
+done
+
+if [[ -z "$PROXY_PUBKEY" ]]; then
+    echo "ERROR: Gateway proxy public key not found (checked /etc/loginbox/proxy_id_ed25519.pub)." >&2
+    exit 1
+fi
+cp "$PROXY_PUBKEY" "${SSHD_DIR}/authorized_keys"
+chmod 600 "${SSHD_DIR}/authorized_keys"
+
+# 3. Create xauth wrapper so X11 cookies stay in /tmp/sshd/.Xauthority (zero $HOME clutter)
+cat > "${SSHD_DIR}/xauth-wrapper.sh" << 'EOF'
+#!/bin/bash
+export XAUTHORITY=/tmp/sshd/.Xauthority
+exec /usr/bin/xauth -f /tmp/sshd/.Xauthority "$@"
+EOF
+chmod 755 "${SSHD_DIR}/xauth-wrapper.sh"
+
+# 4. Discover private internal IPv4 addresses (RFC1918 + 127.0.0.1; never public NICs)
+declare -A SEEN_IPS=()
+LISTEN_LINES=("ListenAddress 127.0.0.1")
+SEEN_IPS["127.0.0.1"]=1
+
+if [[ -n "${LOGINBOX_BIND_IPS:-}" ]]; then
+    for ip in ${LOGINBOX_BIND_IPS//,/ }; do
+        if [[ -n "$ip" && -z "${SEEN_IPS[$ip]:-}" ]]; then
+            LISTEN_LINES+=("ListenAddress ${ip}")
+            SEEN_IPS["$ip"]=1
+        fi
+    done
+else
+    for ip in $(hostname -I 2>/dev/null || true); do
+        case "$ip" in
+            10.*|192.168.*|172.1[6-9].*|172.2[0-9].*|172.3[0-1].*)
+                if [[ -z "${SEEN_IPS[$ip]:-}" ]]; then
+                    LISTEN_LINES+=("ListenAddress ${ip}")
+                    SEEN_IPS["$ip"]=1
+                fi
+                ;;
+        esac
+    done
+fi
+
+port_in_use() {
+    local p="$1"
+    ss -ltnH "sport = :${p}" 2>/dev/null | grep -q .
+}
+
+# 5. Select collision-free port (login: 20000+ fallback 25000..29999; robot: 30000+ fallback 35000..39999)
+if [[ "$SESSION_MODE" == "robot" ]]; then
+    BASE_PORT=30000
+    FALLBACK_START=35000
+    FALLBACK_END=39999
+else
+    BASE_PORT=20000
+    FALLBACK_START=25000
+    FALLBACK_END=29999
+fi
+
+PORT=$(( BASE_PORT + UID_NUM - 50000 ))
+if (( PORT < BASE_PORT || PORT > 60000 )) || port_in_use "$PORT"; then
+    for candidate in $(seq "$FALLBACK_START" "$FALLBACK_END"); do
+        if ! port_in_use "$candidate"; then
+            PORT="$candidate"
+            break
+        fi
+    done
+fi
+
+SETENV_LINE="XAUTHORITY=/tmp/sshd/.Xauthority LOGIN_JOB_ID=${JOB_ID} OMPI_MCA_rmaps_base_oversubscribe=1"
+if [[ -n "$RESOLVED_SLURM_CONF" ]]; then
+    SETENV_LINE="${SETENV_LINE} SLURM_CONF=${RESOLVED_SLURM_CONF}"
+fi
+
+# 6. Write non-root in-container sshd_config in /tmp/sshd
+{
+    echo "Port ${PORT}"
+    for line in "${LISTEN_LINES[@]}"; do
+        echo "$line"
+    done
+    cat << EOF
+HostKey ${SSHD_DIR}/ssh_host_ed25519_key
+AuthorizedKeysFile ${SSHD_DIR}/authorized_keys
+PidFile ${SSHD_DIR}/sshd.pid
+UsePAM no
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PubkeyAuthentication yes
+StrictModes no
+PermitUserEnvironment no
+AcceptEnv LANG LC_* SSH_ORIGINAL_COMMAND
+SetEnv ${SETENV_LINE}
+X11Forwarding yes
+X11DisplayOffset 10
+X11UseLocalhost yes
+XAuthLocation ${SSHD_DIR}/xauth-wrapper.sh
+AllowTcpForwarding yes
+AllowStreamLocalForwarding yes
+AllowAgentForwarding yes
+GatewayPorts clientspecified
+Subsystem sftp internal-sftp
+LogLevel INFO
+EOF
+} > "${SSHD_DIR}/sshd_config"
+chmod 600 "${SSHD_DIR}/sshd_config"
+
+# 7. Compute host key SHA256 fingerprint + Ed25519 base64 public key for strict pinning
+FP=$(ssh-keygen -lf "${SSHD_DIR}/ssh_host_ed25519_key.pub" | awk '{print $2}')
+PUB_B64=$(awk '{print $2}' "${SSHD_DIR}/ssh_host_ed25519_key.pub")
+
+# 8. Start sshd in a scrubbed environment (so user sessions do not inherit SLURM_*
+#    variables from the login allocation and can submit normal srun/salloc/sbatch jobs)
+ENV_ARGS=(
+    PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    HOME="${HOME:-/home/${USER_NAME}}"
+    USER="${USER_NAME}"
+    LOGNAME="${USER_NAME}"
+    SHELL="${SHELL:-/bin/bash}"
+    LANG="${LANG:-C.UTF-8}"
+    XAUTHORITY="/tmp/sshd/.Xauthority"
+    LOGIN_JOB_ID="${JOB_ID}"
+)
+if [[ -n "$RESOLVED_SLURM_CONF" ]]; then
+    ENV_ARGS+=(SLURM_CONF="${RESOLVED_SLURM_CONF}")
+fi
+
+env -i "${ENV_ARGS[@]}" \
+    /usr/sbin/sshd -D -e -f "${SSHD_DIR}/sshd_config" >"${SSHD_DIR}/sshd.log" 2>&1 &
+SSHD_PID=$!
+
+# 9. Wait until sshd is listening on PORT before publishing Comment
+READY=0
+for _ in $(seq 1 100); do
+    if ! kill -0 "$SSHD_PID" 2>/dev/null; then
+        echo "ERROR: In-container sshd exited prematurely:" >&2
+        cat "${SSHD_DIR}/sshd.log" >&2 || true
+        exit 1
+    fi
+    if port_in_use "$PORT"; then
+        READY=1
+        break
+    fi
+    sleep 0.02
+done
+
+if [[ "$READY" -ne 1 ]]; then
+    echo "ERROR: Timed out waiting for in-container sshd on port ${PORT}." >&2
+    cat "${SSHD_DIR}/sshd.log" >&2 || true
+    kill "$SSHD_PID" 2>/dev/null || true
+    exit 1
+fi
+
+# 10. Publish <node>:<port>:<fingerprint>,<pubkey_b64> to Slurm job Comment
+if [[ -n "$JOB_ID" ]]; then
+    scontrol update JobId="$JOB_ID" Comment="${NODE}:${PORT}:${FP},${PUB_B64}"
+fi
+
+# 11. Pre-configure tmux server for interactive login jobs (skipped for smaller robot jobs)
+export TMPDIR=/tmp
+if [[ "$SESSION_MODE" != "robot" ]]; then
+    tmux start-server \; set-option -g exit-empty off 2>/dev/null || true
+fi
+touch /tmp/.login_container_ready
+
+wait "$SSHD_PID"

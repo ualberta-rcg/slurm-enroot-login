@@ -1,29 +1,30 @@
-# Runtime injection tracking
+# Runtime Injection & Secret Hygiene Tracking
 
-Everything site-specific or secret that the login environment needs, and
-**how it gets there at runtime** — because this image is public and must
-never contain any of it. Add a row whenever a new runtime dependency is
-introduced.
+Everything site-specific or secret that the login gateway and container
+userland need, and **how it gets there at runtime** — because this repository
+and its Docker Hub image are **public** and must never contain any secrets,
+credentials, cluster IPs/domains, or PII.
 
-| Item | Why not baked | Injection mechanism |
+| Item | Why not baked | Runtime injection mechanism |
 |---|---|---|
-| Munge key/socket | cluster secret | bind-mount `/run/munge` (read-only) from the host into the container |
-| Slurm config (configless) | cluster config | bind-mount host's config cache `/run/slurm/conf`, or rely on `_slurmctld._tcp` DNS SRV — entrypoint preserves `SLURM_CONF` |
-| User/group resolution | site LDAP/SSSD | bind-mount `/etc/sssd` (and sssd socket) or use `nss_slurm` from the job environment |
-| CVMFS software stack (`/cvmfs`, incl. soft.computecanada.ca) | host-managed fuse mounts | bind-mount `/cvmfs` from the execution node (client + config live on the host, not here) |
-| Home / scratch / projects | per-user data | `--container-mounts` computed per user by the gateway dispatcher (own home/scratch + member-group projects only) |
-| `/tmp`, `/dev/shm` | per-job isolation | `job_container/tmpfs` (Slurm-side, not an image concern) |
-| Site motd / banner | per-cluster text | overlay or bind-mount at dispatch |
-| PAM / Duo / 2FA | gateway concern only — the container has no sshd | lives on the gateway node image, not here |
-| OOD portal, portal TLS | gateway concern only | gateway node |
-| LDAP admin password, TrueNAS API key, SSH host keys | cluster secrets (current Eureka: login overlay) | gateway node overlays; must never enter this repo |
-| Cluster name / ctld hosts | per-cluster | DNS SRV record or bind-mounted config cache |
-| License keys (compilers, etc.) | per-site licenses | mount license env/server config at runtime |
+| Munge key/socket | cluster secret | bind-mount `/run/munge` from the host into the container |
+| Slurm config (configless) | cluster config | bind-mount `/etc/slurm` or `/run/slurm/conf`, or bootstrap `sackd` via `_slurmctld._tcp` DNS SRV (`login-shell` & `container-sshd-entrypoint` preserve `SLURM_CONF`) |
+| Gateway-to-container SSH proxy keypair | per-cluster auth secret | generated on first boot by `loginbox-keygen.service` at `/etc/loginbox/proxy_id_ed25519` (`0600` root); `.pub` bind-mounted read-only into `/tmp/sshd/authorized_keys` |
+| In-container `sshd` host key | per-job identity | generated ephemerally in job tmpfs (`/tmp/sshd/ssh_host_ed25519_key`) by `container-sshd-entrypoint` and pinned via Slurm job `Comment`; `/etc/ssh/ssh_host_*` is stripped in `Dockerfile` |
+| User/group resolution | site LDAP/SSSD | gateway SSSD (`getent -s sss`) + `libnss_shim` on the host; Slurm/NSS inside container |
+| CVMFS software stack (`/cvmfs`) | host-managed FUSE mounts | bind-mount `/cvmfs` from the execution node |
+| Home / scratch / projects | per-user data | `--container-mounts` computed per user by `login-spawn.sh` (own home/scratch + member-group projects only) |
+| `/tmp`, `/dev/shm` | per-job isolation | `job_container/tmpfs` (`Shared=true` in `job_container.conf`) |
+| Site gateway tunables | per-cluster sizing & groups | `/etc/loginbox/loginbox.conf` (`LOGIN_MEM`, `ROBOT_MEM`, `GATEWAY_BYPASS_GROUPS`, `ROBOT_GROUP`, `INTERNAL_CIDRS`) |
+| CILogon OAuth2 / OOD OIDC client secrets | IdP credentials | `/etc/pam_oauth2_device/config.json` and `/etc/ood/config/ood_portal.yml` on gateway node overlays |
+| LDAP admin password & TrueNAS API key | storage/IdP secrets | `/etc/loginbox/ldap_admin_password` and `/etc/truenas/api_key` (`0600`) referenced by `/etc/loginbox/provisioning.conf` |
+| Gateway SSH host keys & portal TLS certs | host identity | gateway node overlays |
 
 ## Enforcement
 
-* `test-image.yml` runs a pattern scan (private keys, passwords, tokens)
-  over the repo and fails on any hit.
-* Rule of thumb for contributors: if a value would let someone authenticate,
-  decrypt, or reach a private cluster resource — it belongs on this page's
-  right-hand column, not in a commit.
+* `gateway/tests/scan_secrets_pii.py` runs in `.github/workflows/test-image.yml`
+  on every push and fails the build on any private key, certificate, inline
+  secret/token, Duo/CILogon client ID, hashed OIDC user ID (`clg_<hex>`), or
+  site IP/domain leakage.
+* `Dockerfile` removes `/etc/ssh/ssh_host_*` during build and CI verifies no
+  host keys exist inside the built container image.

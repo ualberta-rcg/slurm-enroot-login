@@ -1,0 +1,22 @@
+ssh:
+  listen: 0.0.0.0:2222
+  hostkeys:
+    - /etc/loginbox/ssh_host_ed25519_key
+backend: sshproxy
+auth:
+  publicKey:
+    method: webhook
+    webhook:
+      url: "http://127.0.0.1:18080"
+      authTimeout: 60s
+  authz:
+    method: webhook
+    webhook:
+      url: "http://127.0.0.1:18080"
+      authTimeout: 60s
+configserver:
+  url: "http://127.0.0.1:18080/config"
+log:
+  level: warning
+  format: text
+  destination: stdout

@@ -1,0 +1,27 @@
+# /etc/loginbox/provisioning.conf
+# Site-specific endpoints and paths for dynamic CILogon + Open OnDemand user
+# provisioning. Never commit real credentials or cluster IPs into git.
+
+PROVISION_LOG="/var/log/user-provision.log"
+
+# TrueNAS ZFS home provisioning API
+TRUENAS_HOST="https://storage.internal.example.org"
+TRUENAS_API_KEY_FILE="/etc/truenas/api_key"
+TRUENAS_POOL="tank/home"
+TRUENAS_MNT="/mnt/tank/home"
+QUOTA_DEFAULT="5368709120"
+NFS_ALLOWED_NETWORKS='["192.0.2.0/24"]'
+
+# Slurm default account
+SLURM_DEFAULT_ACCOUNT="main"
+
+# OpenLDAP user/group directory
+LDAP_HOST="ldap://ldap.internal.example.org:389"
+LDAP_BASEDN="ou=People,dc=cluster,dc=example,dc=org"
+LDAP_GROUP_BASEDN="ou=Group,dc=cluster,dc=example,dc=org"
+LDAP_BIND_DN="cn=admin,dc=cluster,dc=example,dc=org"
+LDAP_ADMIN_PASSWORD_FILE="/etc/loginbox/ldap_admin_password"
+LDAP_MIN_UID="50000"
+
+# Prefix for hashed OIDC subject usernames (e.g. usr_ or clg_)
+OIDC_USER_PREFIX="usr_"

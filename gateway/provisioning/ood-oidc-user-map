@@ -1,0 +1,109 @@
+#!/bin/bash
+# /usr/local/bin/ood-oidc-user-map
+# Open OnDemand user_map_cmd: maps CILogon OIDC sub (REMOTE_USER) to hashed username.
+set -uo pipefail
+
+[[ -r /etc/loginbox/provisioning.conf ]] && source /etc/loginbox/provisioning.conf
+
+LDAP_HOST="${LDAP_HOST:-ldap://ldap.internal.example.org:389}"
+LDAP_BASEDN="${LDAP_BASEDN:-ou=People,dc=cluster,dc=example,dc=org}"
+LDAP_GROUP_BASEDN="${LDAP_GROUP_BASEDN:-ou=Group,dc=cluster,dc=example,dc=org}"
+LDAP_BIND_DN="${LDAP_BIND_DN:-cn=admin,dc=cluster,dc=example,dc=org}"
+LDAP_PASSWORD_FILE="${LDAP_ADMIN_PASSWORD_FILE:-/etc/loginbox/ldap_admin_password}"
+LDAP_MIN_UID="${LDAP_MIN_UID:-50000}"
+OIDC_USER_PREFIX="${OIDC_USER_PREFIX:-clg_}"
+
+urldecode() {
+    local s="${*//+/ }"
+    printf '%b\n' "${s//%/\\x}"
+}
+
+hash_from_sub() {
+    local sub="$1"
+    local hex
+    if command -v sha256sum &>/dev/null; then
+        hex=$(echo -n "${sub}" | sha256sum | awk '{print $1}')
+    elif command -v shasum &>/dev/null; then
+        hex=$(echo -n "${sub}" | shasum -a 256 | awk '{print $1}')
+    else
+        return 1
+    fi
+    echo "${OIDC_USER_PREFIX}${hex:0:12}"
+}
+
+get_ldap_pw() {
+    if [[ -n "${LDAP_ADMIN_PASSWORD:-}" ]]; then
+        echo "${LDAP_ADMIN_PASSWORD}"
+        return 0
+    fi
+    if [[ -f "${LDAP_PASSWORD_FILE}" ]]; then
+        cat "${LDAP_PASSWORD_FILE}"
+        return 0
+    fi
+    return 1
+}
+
+INPUT="${1:?usage: ood-oidc-user-map <url-encoded-remote-user>}"
+SUB=$(urldecode "${INPUT}")
+[[ -z "${SUB}" ]] && exit 1
+
+HASH=$(hash_from_sub "${SUB}") || exit 1
+LDAP_PW=$(get_ldap_pw) || exit 1
+
+existing=$(ldapsearch -x -H "${LDAP_HOST}" -D "${LDAP_BIND_DN}" -w "${LDAP_PW}" \
+    -b "${LDAP_BASEDN}" -s sub "(uid=${HASH})" uid -LLL 2>/dev/null | grep -c "^uid:" || true)
+
+if [[ "${existing}" -gt 0 ]]; then
+    echo "${HASH}"
+    exit 0
+fi
+
+HIGHEST_UID=$(ldapsearch -x -H "${LDAP_HOST}" -D "${LDAP_BIND_DN}" -w "${LDAP_PW}" \
+    -b "${LDAP_BASEDN}" -s sub "(objectClass=posixAccount)" uidNumber -LLL 2>/dev/null | \
+    awk '/^uidNumber:/ {print $2}' | sort -n | tail -n 1)
+
+NEXT_UID=$(( ${HIGHEST_UID:-0} + 1 ))
+[[ "${NEXT_UID}" -lt "${LDAP_MIN_UID}" ]] && NEXT_UID="${LDAP_MIN_UID}"
+
+GROUP_FILE=$(mktemp)
+USER_FILE=$(mktemp)
+trap 'rm -f "${GROUP_FILE}" "${USER_FILE}"' EXIT
+
+cat <<EOF > "${GROUP_FILE}"
+dn: cn=${HASH},${LDAP_GROUP_BASEDN}
+objectClass: posixGroup
+cn: ${HASH}
+gidNumber: ${NEXT_UID}
+memberUid: ${HASH}
+EOF
+
+ldapadd -x -H "${LDAP_HOST}" -D "${LDAP_BIND_DN}" -w "${LDAP_PW}" -f "${GROUP_FILE}" >/dev/null 2>&1 || true
+
+cat <<EOF > "${USER_FILE}"
+dn: uid=${HASH},${LDAP_BASEDN}
+objectClass: inetOrgPerson
+objectClass: posixAccount
+objectClass: shadowAccount
+uid: ${HASH}
+uidNumber: ${NEXT_UID}
+gidNumber: ${NEXT_UID}
+homeDirectory: /home/${HASH}
+loginShell: /bin/bash
+userPassword: {CRYPT}!
+cn: ${HASH}
+sn: ${HASH}
+givenName: ${HASH}
+displayName: ${HASH}
+mail: stub@local
+employeeNumber: ${SUB}
+employeeType: external
+description: AuthSource=CILogon;Protocol=OIDC
+EOF
+
+if ! ldapadd -x -H "${LDAP_HOST}" -D "${LDAP_BIND_DN}" -w "${LDAP_PW}" -f "${USER_FILE}" >/dev/null 2>&1; then
+    logger -t ood-oidc-map "user add failed for ${HASH}"
+    exit 1
+fi
+
+echo "${HASH}"
+exit 0

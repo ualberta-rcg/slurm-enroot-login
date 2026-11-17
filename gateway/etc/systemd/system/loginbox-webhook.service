@@ -1,0 +1,22 @@
+[Unit]
+Description=Loginbox Auth & Routing Webhook Server
+After=network-online.target remote-fs.target sssd.service munge.service slurmd.service
+Wants=network-online.target
+RequiresMountsFor=/cache
+
+[Service]
+Type=simple
+User=root
+Group=root
+Environment="LOGINBOX_DIR=/etc/loginbox"
+Environment="ROUTE_DIR=/run/loginbox/routes"
+Environment="PROXY_PRIVKEY_PATH=/etc/loginbox/proxy_id_ed25519"
+Environment="CLIENT_AUTHKEYS_PATH=/etc/loginbox/client_authorized_keys"
+Environment="SPAWN_SCRIPT=/usr/local/bin/login-spawn.sh"
+ExecStartPre=/bin/mkdir -p /run/loginbox/routes
+ExecStart=/usr/bin/python3 /usr/local/bin/loginbox-webhook.py
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

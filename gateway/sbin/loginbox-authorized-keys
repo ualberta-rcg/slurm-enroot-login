@@ -1,0 +1,99 @@
+#!/bin/bash
+# /usr/local/sbin/loginbox-authorized-keys
+# Unified Port-22 OpenSSH AuthorizedKeysCommand helper:
+#   loginbox-authorized-keys internal <username>
+#     Used inside `Match Address <INTERNAL_CIDRS>` (OOD Web Shell, compute nodes).
+#     Queries SSSD directly (`getent -s sss`) to bypass libnss_shim inside
+#     ssh.service, returning keys from sss_ssh_authorizedkeys and strictly
+#     permission-verified ~/.ssh/authorized_keys.
+#
+#   loginbox-authorized-keys external <username>
+#     Used globally on Port 22 for external connections.
+#     Delegates to sss_ssh_authorizedkeys.filter --inject-robot-marker so ONLY
+#     users in ROBOT_GROUP presenting valid `restrict,from="...",command="..."`
+#     keys can authenticate via publickey on external Port 22; all normal users
+#     receive empty output in ~1ms (zero autofs touch) and fall through cleanly
+#     to CILogon Device Flow (keyboard-interactive:pam).
+set -uo pipefail
+
+CONF_FILE="/etc/loginbox/loginbox.conf"
+[[ -r "$CONF_FILE" ]] && source "$CONF_FILE"
+
+MIN_CLUSTER_UID="${MIN_CLUSTER_UID:-10000}"
+
+MODE="${1:-external}"
+TARGET_USER="${2:-}"
+
+if [[ -z "$TARGET_USER" || ! "$TARGET_USER" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+    exit 0
+fi
+
+case "$TARGET_USER" in
+    root|sshd|munge|slurm|cilogon|nobody|ubuntu|www-data)
+        exit 0
+        ;;
+esac
+
+if [[ "$MODE" == "external" ]]; then
+    exec /usr/local/bin/sss_ssh_authorizedkeys.filter --inject-robot-marker "$TARGET_USER"
+fi
+
+if [[ "$MODE" != "internal" ]]; then
+    exit 0
+fi
+
+# Internal mode: resolve real LDAP user via SSSD (bypassing libnss_shim in ssh.service)
+PW_LINE=$(getent -s sss passwd "$TARGET_USER" 2>/dev/null || true)
+if [[ -z "$PW_LINE" ]]; then
+    exit 0
+fi
+
+IFS=":" read -r _pw_name _pw_x USER_UID _pw_gid _pw_gecos USER_HOME _pw_shell <<< "$PW_LINE"
+if [[ -z "${USER_UID:-}" ]] || (( USER_UID < MIN_CLUSTER_UID )); then
+    exit 0
+fi
+
+if [[ -x /usr/bin/sss_ssh_authorizedkeys ]]; then
+    /usr/bin/sss_ssh_authorizedkeys "$TARGET_USER" 2>/dev/null || true
+fi
+
+if [[ -n "$USER_HOME" ]]; then
+    python3 - "$USER_HOME" "$USER_UID" << 'PYEOF'
+import os, stat, sys
+
+homedir = sys.argv[1]
+expected_uid = int(sys.argv[2])
+
+def check_dir(path, allow_root=False):
+    st = os.lstat(path)
+    if not stat.S_ISDIR(st.st_mode):
+        return False
+    if st.st_uid != expected_uid and not (allow_root and st.st_uid == 0):
+        return False
+    if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        return False
+    return True
+
+try:
+    if not check_dir(homedir, allow_root=True):
+        sys.exit(0)
+    ssh_dir = os.path.join(homedir, ".ssh")
+    if not check_dir(ssh_dir, allow_root=False):
+        sys.exit(0)
+    ak_path = os.path.join(ssh_dir, "authorized_keys")
+    st_ak = os.lstat(ak_path)
+    if not stat.S_ISREG(st_ak.st_mode):
+        sys.exit(0)
+    if st_ak.st_uid != expected_uid:
+        sys.exit(0)
+    if st_ak.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        sys.exit(0)
+    fd = os.open(ak_path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, "r", encoding="utf-8", errors="replace") as fh:
+        sys.stdout.write(fh.read())
+except OSError:
+    sys.exit(0)
+PYEOF
+fi
+
+exit 0

@@ -33,9 +33,11 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN groupadd -g 999 slurm && useradd -u 999 -g 999 -M -s /usr/sbin/nologin slurm && \
     groupadd -g 972 munge && useradd -u 972 -g 972 -M -s /usr/sbin/nologin munge
 
-# --- Base interactive tooling (no services, no sshd) ---
+# --- Base interactive tooling + non-root container sshd support ---
 # CVMFS client from the public CERN repo (24-install-cvmfs parity); the
 # site config (default.local, proxies) is runtime-injected, never baked.
+# openssh-server + xauth support persistent per-user in-container sshd
+# sessions (host keys are deleted immediately; ephemeral keys live in /tmp).
 RUN echo "deb [trusted=yes] http://cvmrepo.s3.cern.ch/cvmrepo/apt noble-prod main" \
         > /etc/apt/sources.list.d/cernvm.list
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -50,6 +52,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     tmux \
     screen \
     openssh-client \
+    openssh-server \
+    xauth \
     rsync \
     tar \
     gzip \
@@ -152,6 +156,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     rdma-core \
     ibverbs-utils \
     rrdtool \
+    && rm -f /etc/ssh/ssh_host_* \
+    && mkdir -p /run/sshd \
     && rm -rf /var/lib/apt/lists/*
 
 # Ubuntu names these binaries batcat/fdfind; users expect bat/fd
@@ -200,7 +206,8 @@ RUN mkdir -p /etc/slurm/plugstack.d && \
 #   srun --container-image=... /usr/local/bin/login-shell
 COPY login-shell /usr/local/bin/login-shell
 COPY slurm-login-shell /usr/local/bin/slurm-login-shell
-RUN chmod 755 /usr/local/bin/login-shell /usr/local/bin/slurm-login-shell
+COPY container-sshd-entrypoint /usr/local/bin/container-sshd-entrypoint
+RUN chmod 755 /usr/local/bin/login-shell /usr/local/bin/slurm-login-shell /usr/local/bin/container-sshd-entrypoint
 
 # CVMFS module stack hook (Alliance/CC): runs after Ubuntu's
 # environment-modules profile script (zz- sorts last) and redefines

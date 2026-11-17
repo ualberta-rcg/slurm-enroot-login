@@ -1,0 +1,41 @@
+{
+  "databases": {
+    "group": {
+      "functions": {
+        "get_all_entries": {
+          "command": "/bin/true"
+        },
+        "get_entry_by_gid": {
+          "command": "/bin/true"
+        },
+        "get_entry_by_name": {
+          "command": "/usr/local/bin/fake_nss_group.sh"
+        }
+      }
+    },
+    "passwd": {
+      "functions": {
+        "get_all_entries": {
+          "command": "/bin/true"
+        },
+        "get_entry_by_uid": {
+          "command": "/bin/true"
+        },
+        "get_entry_by_name": {
+          "command": "/usr/local/bin/fake_nss_user.sh"
+        }
+      }
+    },
+    "shadow": {
+      "functions": {
+        "get_all_entries": {
+          "command": "/bin/true"
+        },
+        "get_entry_by_name": {
+          "command": "/bin/true"
+        }
+      }
+    }
+  },
+  "debug": false
+}

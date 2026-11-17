@@ -1,0 +1,116 @@
+#!/bin/bash
+# /usr/local/bin/sss_ssh_authorizedkeys.filter
+# Alliance-compatible Robot SSH key wrapper: fetches user public keys via SSSD
+# (and optionally strictly permission-checked ~/.ssh/authorized_keys) for users
+# in ROBOT_GROUP, then filters through sss_ssh_authorizedkeys.filter.py so ONLY
+# restricted (restrict + from="..." + command="...") robot keys are returned.
+set -uo pipefail
+
+CONF_FILE="/etc/loginbox/loginbox.conf"
+[[ -r "$CONF_FILE" ]] && source "$CONF_FILE"
+
+ROBOT_GROUP="${ROBOT_GROUP:-mfa-automation-users}"
+ALLOW_HOME_ROBOT_KEYS="${ALLOW_HOME_ROBOT_KEYS:-1}"
+MIN_CLUSTER_UID="${MIN_CLUSTER_UID:-10000}"
+
+INJECT_ARG=""
+if [[ "${1:-}" == "--inject-robot-marker" ]]; then
+    INJECT_ARG="--inject-robot-marker"
+    shift
+fi
+
+TARGET_USER="${1:-}"
+if [[ -z "$TARGET_USER" || ! "$TARGET_USER" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+    exit 0
+fi
+
+case "$TARGET_USER" in
+    root|sshd|munge|slurm|cilogon|nobody|ubuntu|www-data)
+        exit 0
+        ;;
+esac
+
+# Bypass libnss_shim inside ssh.service by querying SSSD directly (zero autofs touch)
+PW_LINE=$(getent -s sss passwd "$TARGET_USER" 2>/dev/null || true)
+if [[ -z "$PW_LINE" ]]; then
+    exit 0
+fi
+
+IFS=":" read -r _pw_name _pw_x USER_UID USER_GID _pw_gecos USER_HOME _pw_shell <<< "$PW_LINE"
+if [[ -z "${USER_UID:-}" ]] || (( USER_UID < MIN_CLUSTER_UID )); then
+    exit 0
+fi
+
+# Verify membership in ROBOT_GROUP via SSSD before touching /home or autofs
+GRP_LINE=$(getent -s sss group "$ROBOT_GROUP" 2>/dev/null || getent -s files group "$ROBOT_GROUP" 2>/dev/null || true)
+if [[ -z "$GRP_LINE" ]]; then
+    exit 0
+fi
+
+IFS=":" read -r _g_name _g_pw GRP_GID GRP_MEMBERS <<< "$GRP_LINE"
+IS_MEMBER=0
+if [[ "${USER_GID:-}" == "${GRP_GID:-}" ]]; then
+    IS_MEMBER=1
+else
+    IFS="," read -ra M_ARR <<< "${GRP_MEMBERS:-}"
+    for m in "${M_ARR[@]}"; do
+        if [[ "$m" == "$TARGET_USER" ]]; then
+            IS_MEMBER=1
+            break
+        fi
+    done
+fi
+
+if [[ "$IS_MEMBER" -ne 1 ]]; then
+    exit 0
+fi
+
+read_safe_home_keys() {
+    python3 - "$USER_HOME" "$USER_UID" << 'PYEOF'
+import os, stat, sys
+
+homedir = sys.argv[1]
+expected_uid = int(sys.argv[2])
+
+def check_dir(path, allow_root=False):
+    st = os.lstat(path)
+    if not stat.S_ISDIR(st.st_mode):
+        return False
+    if st.st_uid != expected_uid and not (allow_root and st.st_uid == 0):
+        return False
+    if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        return False
+    return True
+
+try:
+    if not check_dir(homedir, allow_root=True):
+        sys.exit(0)
+    ssh_dir = os.path.join(homedir, ".ssh")
+    if not check_dir(ssh_dir, allow_root=False):
+        sys.exit(0)
+    ak_path = os.path.join(ssh_dir, "authorized_keys")
+    st_ak = os.lstat(ak_path)
+    if not stat.S_ISREG(st_ak.st_mode):
+        sys.exit(0)
+    if st_ak.st_uid != expected_uid:
+        sys.exit(0)
+    if st_ak.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        sys.exit(0)
+    fd = os.open(ak_path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, "r", encoding="utf-8", errors="replace") as fh:
+        sys.stdout.write(fh.read())
+except OSError:
+    sys.exit(0)
+PYEOF
+}
+
+FILTER_PY="/usr/local/bin/sss_ssh_authorizedkeys.filter.py"
+{
+    if [[ -x /usr/bin/sss_ssh_authorizedkeys ]]; then
+        /usr/bin/sss_ssh_authorizedkeys "$TARGET_USER" 2>/dev/null || true
+    fi
+    if [[ "$ALLOW_HOME_ROBOT_KEYS" == "1" && -n "$USER_HOME" ]]; then
+        read_safe_home_keys
+    fi
+} | python3 "$FILTER_PY" ${INJECT_ARG:+$INJECT_ARG}
+exit 0
