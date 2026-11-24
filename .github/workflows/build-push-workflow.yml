@@ -36,6 +36,7 @@ on:
       - 'login-shell'
       - 'slurm-login-shell'
       - 'container-sshd-entrypoint'
+      - 'admin-pod/**'
       - '.github/workflows/build-push-workflow.yml'
   # Self-rebuild: warewulf-slurmd builds new Slurm DEBs Mondays ~02:00 UTC
   # and its images ~03:00; we check Tuesdays and pick up whatever is newest.
@@ -51,7 +52,7 @@ jobs:
   build-and-push:
     name: 🐳 Build & Push
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 60
     env:
       DOCKER_REPO: ${{ secrets.DOCKER_HUB_REPO || vars.DOCKER_HUB_REPO }}
     steps:
@@ -129,6 +130,26 @@ jobs:
           docker run --rm --entrypoint bash $DOCKER_REPO:latest -c 'ls /etc/ssh/ssh_host_* >/dev/null 2>&1 && exit 1 || exit 0'
           docker run --rm --entrypoint bash $DOCKER_REPO:latest /usr/local/bin/login-shell -c 'echo scrub-ok'
 
+      - name: 🐳 Build Admin Image
+        if: env.skip != 'true'
+        run: |
+          set -o pipefail
+          docker build -f admin-pod/Dockerfile -t $DOCKER_REPO:admin-${{ env.version }} . 2>&1 | tee /tmp/admin-build.log || {
+            echo "::error::admin build failed: $(grep -vE '^ #[0-9]+ \[|^ *[0-9]+ \||^>>>|^ ---$' /tmp/admin-build.log | tail -n8 | tr '\n' ' ' | cut -c1-800)"
+            exit 1
+          }
+          docker tag $DOCKER_REPO:admin-${{ env.version }} $DOCKER_REPO:admin
+
+      - name: 🧪 Smoke Test Admin Image
+        if: env.skip != 'true'
+        run: |
+          docker run --rm --entrypoint test $DOCKER_REPO:admin -x /usr/local/bin/admin-container-sshd-entrypoint
+          docker run --rm --entrypoint test $DOCKER_REPO:admin -x /usr/local/bin/admin-login-shell
+          docker run --rm --entrypoint bash $DOCKER_REPO:admin -lc 'command -v sudo && command -v su && command -v sshd'
+          docker run --rm --entrypoint bash $DOCKER_REPO:admin -c 'find /lib /usr/lib -name pam_sss.so | grep -q pam_sss'
+          docker run --rm --entrypoint bash $DOCKER_REPO:admin -c 'test -f /etc/sudoers.d/gateway-admins && visudo -cf /etc/sudoers.d/gateway-admins'
+          docker run --rm --entrypoint bash $DOCKER_REPO:admin -c 'ls /etc/ssh/ssh_host_* >/dev/null 2>&1 && exit 1 || exit 0'
+
       - name: 🔑 Docker Hub Login
         if: env.skip != 'true'
         run: |
@@ -143,4 +164,6 @@ jobs:
         run: |
           docker push $DOCKER_REPO:${{ env.version }}
           docker push $DOCKER_REPO:latest
-          echo "## Pushed $DOCKER_REPO:${{ env.version }} + :latest" >> $GITHUB_STEP_SUMMARY
+          docker push $DOCKER_REPO:admin-${{ env.version }}
+          docker push $DOCKER_REPO:admin
+          echo "## Pushed $DOCKER_REPO:${{ env.version }} + :latest and :admin-${{ env.version }} + :admin" >> $GITHUB_STEP_SUMMARY

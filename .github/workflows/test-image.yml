@@ -43,6 +43,7 @@ jobs:
         run: |
           set -e
           bash -n login-shell slurm-login-shell container-sshd-entrypoint
+          bash -n admin-pod/admin-login-shell admin-pod/admin-container-sshd-entrypoint
           bash -n gateway/bin/*.sh gateway/bin/enter-login-job gateway/bin/sss_ssh_authorizedkeys.filter
           bash -n gateway/sbin/loginbox-authorized-keys
           bash -n gateway/provisioning/*.sh gateway/provisioning/ood-oidc-user-map
@@ -57,7 +58,7 @@ jobs:
     name: 🐳 Build & Smoke Test
     runs-on: ubuntu-24.04
     needs: secrets-and-unit-tests
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - name: 🛠️ Checkout Repository
         uses: actions/checkout@v4
@@ -116,3 +117,30 @@ jobs:
           check "claude installed"    docker run --rm --entrypoint bash sel:test -c 'command -v claude'
           check "cvmfs client"        docker run --rm --entrypoint bash sel:test -c 'command -v cvmfs_config'
           echo "✅ All smoke tests passed (Slurm ${{ env.version }})"
+
+      - name: 🐳 Build Admin Image
+        run: |
+          set -o pipefail
+          docker build -f admin-pod/Dockerfile -t sel:admin . 2>&1 | tee /tmp/admin-build.log || {
+            echo "::error::admin build failed: $(grep -vE '^ #[0-9]+ \[|^ *[0-9]+ \||^>>>|^ ---$' /tmp/admin-build.log | tail -n8 | tr '\n' ' ' | cut -c1-800)"
+            exit 1
+          }
+
+      - name: 🧪 Admin Image Smoke Tests
+        run: |
+          set -e
+          check() {
+            local name="$1"; shift
+            local out
+            if ! out=$("$@" 2>&1); then
+              echo "::error::admin smoke test failed: $name — $(echo "$out" | tail -n3 | tr '\n' ' ' | cut -c1-400)"
+              exit 1
+            fi
+          }
+          check "admin sshd entry"   docker run --rm --entrypoint test sel:admin -x /usr/local/bin/admin-container-sshd-entrypoint
+          check "admin login shell"   docker run --rm --entrypoint test sel:admin -x /usr/local/bin/admin-login-shell
+          check "sudo+su+sshd"        docker run --rm --entrypoint bash sel:admin -lc 'command -v sudo >/dev/null && command -v su >/dev/null && command -v sshd >/dev/null && command -v xauth >/dev/null'
+          check "pam_sss"             docker run --rm --entrypoint bash sel:admin -c 'find /lib /usr/lib -name pam_sss.so | grep -q pam_sss'
+          check "admin sudoers"       docker run --rm --entrypoint bash sel:admin -c 'test -f /etc/sudoers.d/gateway-admins && visudo -cf /etc/sudoers.d/gateway-admins'
+          check "no baked hostkeys"   docker run --rm --entrypoint bash sel:admin -c 'ls /etc/ssh/ssh_host_* >/dev/null 2>&1 && exit 1 || exit 0'
+          echo "✅ Admin image smoke tests passed"

@@ -1,0 +1,5 @@
+# Passwordless sudo inside the admin root pod. Group membership is resolved
+# through SSSD (the pod bind-mounts /var/lib/sss/pipes). The entrypoint also
+# writes a per-user drop-in so sudo still works if the group lookup is down.
+%gateway-admins ALL=(ALL) NOPASSWD: ALL
+%ccstaff ALL=(ALL) NOPASSWD: ALL

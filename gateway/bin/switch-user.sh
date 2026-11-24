@@ -10,11 +10,14 @@
 #   2. Direct Gateway File Transfers (`scp`, `sftp-server`, `rsync --server`,
 #      `rrsync`): validated against shell-metacharacter smuggling and executed
 #      directly on the gateway host inside a per-user cgroup scope (0 Slurm jobs).
-#   3. Gateway Admin Bypass (`GATEWAY_BYPASS_GROUPS`, e.g. `gateway-admins` /
-#      `ccstaff`): drops admins directly onto the gateway host with PTY ownership,
-#      X11, and SSH agent forwarded cleanly (unless `LOGINBOX_FORCE_CONTAINER=1`
-#      or `enter-login-job` / `container` is requested).
-#   4. Slurm Container Routing:
+#   3. Gateway Admin Root Pod (`GATEWAY_BYPASS_GROUPS`, when ADMIN_POD_ENABLED=1):
+#      allocates `admin-<user>` as a UID-0 Slurm/Pyxis pod with all of /home
+#      (and the other shared mounts) so the admin can sudo and su. If the pod
+#      cannot be started or attached, fall back to the gateway host shell.
+#      `host` / LOGINBOX_FORCE_HOST=1 keeps the host shell. `container` /
+#      LOGINBOX_FORCE_CONTAINER=1 still enters the unprivileged login pod.
+#   4. Gateway host shell: used when the admin pod is disabled or unavailable.
+#   5. Slurm Container Routing:
 #      - Normal sessions -> `login-<user>` (`LOGIN_CPUS` / `LOGIN_MEM`)
 #      - Robot sessions  -> `robot-<user>` (`ROBOT_CPUS` / `ROBOT_MEM`, less RAM)
 #      Attaches over internal cluster network with pinned container host key.
@@ -24,6 +27,8 @@ CONF_FILE="/etc/loginbox/loginbox.conf"
 [[ -r "$CONF_FILE" ]] && source "$CONF_FILE"
 
 LOGIN_PARTITION="${LOGIN_PARTITION:-login}"
+ADMIN_PARTITION="${ADMIN_PARTITION:-$LOGIN_PARTITION}"
+ADMIN_POD_ENABLED="${ADMIN_POD_ENABLED:-0}"
 GATEWAY_BYPASS_GROUPS="${GATEWAY_BYPASS_GROUPS:-gateway-admins ccstaff}"
 ROBOT_GROUP="${ROBOT_GROUP:-mfa-automation-users}"
 INTERNAL_CIDRS="${INTERNAL_CIDRS:-10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,127.0.0.0/8}"
@@ -126,10 +131,14 @@ fi
 
 CLI_FORCE_CONTAINER="0"
 CLI_FORCE_ROBOT="0"
+CLI_FORCE_ADMIN="0"
+CLI_FORCE_HOST="0"
 while [[ "${1:-}" == --force-* ]]; do
     case "$1" in
         --force-container) CLI_FORCE_CONTAINER="1"; shift ;;
         --force-robot)     CLI_FORCE_ROBOT="1"; shift ;;
+        --force-admin)     CLI_FORCE_ADMIN="1"; shift ;;
+        --force-host)      CLI_FORCE_HOST="1"; shift ;;
         *) break ;;
     esac
 done
@@ -243,19 +252,30 @@ if [[ $# -ge 2 && "${1:-}" == "-c" ]]; then
     fi
 fi
 
-# Allow explicit opt-in container entry (`ssh -t host container`, `--force-container`, or `LOGINBOX_FORCE_CONTAINER=1`)
+# `container` enters the unprivileged login pod. `host` forces the gateway shell.
+# LOGINBOX_FORCE_CONTAINER / LOGINBOX_FORCE_HOST are the env-var equivalents.
 FORCE_CONTAINER="${LOGINBOX_FORCE_CONTAINER:-0}"
+FORCE_HOST="${LOGINBOX_FORCE_HOST:-0}"
 [[ "$CLI_FORCE_CONTAINER" == "1" ]] && FORCE_CONTAINER="1"
+[[ "$CLI_FORCE_HOST" == "1" ]] && FORCE_HOST="1"
 if [[ "${1:-}" == "container" ]]; then
     FORCE_CONTAINER="1"
     shift
 elif [[ "${1:-}" == "-c" && "${2:-}" == "container" ]]; then
     FORCE_CONTAINER="1"
     set --
+elif [[ "${1:-}" == "host" ]]; then
+    FORCE_HOST="1"
+    shift
+elif [[ "${1:-}" == "-c" && "${2:-}" == "host" ]]; then
+    FORCE_HOST="1"
+    set --
 fi
 
-# ── 3. Gateway Admin Host Bypass (`gateway-admins` / `ccstaff`) ──────────────
-if [[ "$SESSION_MODE" == "login" && "$FORCE_CONTAINER" != "1" ]] && user_in_group_list "$GATEWAY_BYPASS_GROUPS"; then
+# ── 3. Gateway host shell (admin fallback / ADMIN_POD_ENABLED=0) ─────────────
+# Invoked after the admin-pod attempt so a Slurm or image outage still lands
+# the admin somewhere. `exec` means this function does not return.
+enter_gateway_host() {
     ls -d "${USER_HOME}/." >/dev/null 2>&1 || true
 
     USER_RT_DIR="/run/loginbox/user-runtime/${USER_UID}"
@@ -301,7 +321,7 @@ if [[ "$SESSION_MODE" == "login" && "$FORCE_CONTAINER" != "1" ]] && user_in_grou
             chown "${USER_UID}:tty" "$TTY_DEV" 2>/dev/null || true
             chmod 620 "$TTY_DEV" 2>/dev/null || true
         fi
-        if [[ $# -eq 0 && ! -f "${USER_HOME}/.hushlogin" && -f /etc/motd ]]; then
+        if [[ $# -eq 0 && "${MOTD_SHOWN:-0}" != "1" && ! -f "${USER_HOME}/.hushlogin" && -f /etc/motd ]]; then
             cat /etc/motd
         fi
     fi
@@ -320,17 +340,23 @@ if [[ "$SESSION_MODE" == "login" && "$FORCE_CONTAINER" != "1" ]] && user_in_grou
             setpriv --reuid="$USER_UID" --regid="$USER_GID" --init-groups \
             "$@"
     fi
-fi
+}
 
-# ── 4. Slurm Container Job Routing (`login-<user>` vs `robot-<user>`) ────────
+# ── 4. Slurm Container Job Routing (`login-<user>` / `admin-<user>` / `robot-<user>`) ────────
 ROUTE_DIR="/run/loginbox/routes"
-if [[ "$SESSION_MODE" == "robot" ]]; then
-    JOB_NAME="robot-${TARGET_USER}"
-    ROUTE_FILE="${ROUTE_DIR}/robot-${TARGET_USER}"
-else
-    JOB_NAME="login-${TARGET_USER}"
-    ROUTE_FILE="${ROUTE_DIR}/${TARGET_USER}"
-fi
+
+apply_session_route() {
+    if [[ "$SESSION_MODE" == "robot" ]]; then
+        JOB_NAME="robot-${TARGET_USER}"
+        ROUTE_FILE="${ROUTE_DIR}/robot-${TARGET_USER}"
+    elif [[ "$SESSION_MODE" == "admin" ]]; then
+        JOB_NAME="admin-${TARGET_USER}"
+        ROUTE_FILE="${ROUTE_DIR}/admin-${TARGET_USER}"
+    else
+        JOB_NAME="login-${TARGET_USER}"
+        ROUTE_FILE="${ROUTE_DIR}/${TARGET_USER}"
+    fi
+}
 
 if [[ -f /etc/loginbox/proxy_id_ed25519 ]]; then
     PROXY_KEY="/etc/loginbox/proxy_id_ed25519"
@@ -380,8 +406,15 @@ resolve_or_spawn() {
     mkdir -p "$ROUTE_DIR" 2>/dev/null || true
     chmod 755 /run/loginbox "$ROUTE_DIR" 2>/dev/null || true
 
+    local queue_user="$TARGET_USER"
+    local queue_part="$LOGIN_PARTITION"
+    if [[ "$SESSION_MODE" == "admin" ]]; then
+        # admin-<user> is submitted by root on ADMIN_PARTITION.
+        queue_user="root"
+        queue_part="$ADMIN_PARTITION"
+    fi
     local job_info
-    job_info=$(squeue -h -u "$TARGET_USER" -p "$LOGIN_PARTITION" -n "$JOB_NAME" -t R -o "%i|%N|%k" 2>/dev/null | head -n 1 || true)
+    job_info=$(squeue -h -u "$queue_user" -p "$queue_part" -n "$JOB_NAME" -t R -o "%i|%N|%k" 2>/dev/null | head -n 1 || true)
     if [[ -n "$job_info" ]]; then
         IFS="|" read -r s_jid _s_node s_comment <<< "$job_info"
         if [[ "$s_comment" == *:*:* ]]; then
@@ -399,7 +432,11 @@ resolve_or_spawn() {
     fi
 
     if [[ "$IS_TTY" -eq 1 && "$SESSION_MODE" != "robot" ]]; then
-        echo "Starting login container (allocating resources)..." >&2
+        if [[ "$SESSION_MODE" == "admin" ]]; then
+            echo "Starting admin root pod (allocating resources)..." >&2
+        else
+            echo "Starting login container (allocating resources)..." >&2
+        fi
     fi
     local spawn_out
     if ! spawn_out=$(/usr/local/bin/login-spawn.sh --mode "$SESSION_MODE" --user "$TARGET_USER"); then
@@ -459,32 +496,87 @@ run_ssh_attach() {
     fi
 }
 
-# Print MOTD for interactive container logins
-if [[ $# -eq 0 && "$IS_TTY" -eq 1 && "$SESSION_MODE" != "robot" ]]; then
-    ls -d "${USER_HOME}/." >/dev/null 2>&1 || true
-    if [[ ! -f "${USER_HOME}/.hushlogin" && -f /etc/motd ]]; then
-        cat /etc/motd
-    fi
-fi
-
-# Hot Path: attach immediately from cached route file with zero Slurm RPCs
-if [[ -r "$ROUTE_FILE" ]]; then
-    IFS="|" read -r JID CNODE CPORT CFP < "$ROUTE_FILE" || true
-    if [[ -n "${CNODE:-}" && -n "${CPORT:-}" ]]; then
-        run_ssh_attach "$CNODE" "$CPORT" "${CFP:-}" "$@"
-        rc=$?
-        if [[ "$rc" -ne 255 ]]; then
-            exit "$rc"
+# Print MOTD once for interactive logins. The host fallback checks MOTD_SHOWN
+# so a failed admin pod does not print it a second time.
+maybe_print_motd() {
+    if [[ $# -eq 0 && "$IS_TTY" -eq 1 && "$SESSION_MODE" != "robot" && "${MOTD_SHOWN:-0}" != "1" ]]; then
+        ls -d "${USER_HOME}/." >/dev/null 2>&1 || true
+        if [[ ! -f "${USER_HOME}/.hushlogin" && -f /etc/motd ]]; then
+            cat /etc/motd
         fi
+        MOTD_SHOWN=1
     fi
-    rm -f "$ROUTE_FILE" 2>/dev/null || true
+}
+
+# Hot path uses the route file (no Slurm RPC). A dead route falls through to
+# squeue/spawn. SPAWN_FAILED=1 means the caller should not treat the return
+# code as a remote command status.
+attach_routed_session() {
+    SPAWN_FAILED=0
+    if [[ -r "$ROUTE_FILE" ]]; then
+        IFS="|" read -r JID CNODE CPORT CFP < "$ROUTE_FILE" || true
+        if [[ -n "${CNODE:-}" && -n "${CPORT:-}" ]]; then
+            run_ssh_attach "$CNODE" "$CPORT" "${CFP:-}" "$@"
+            local rc=$?
+            if [[ "$rc" -ne 255 ]]; then
+                return "$rc"
+            fi
+        fi
+        rm -f "$ROUTE_FILE" 2>/dev/null || true
+    fi
+
+    JID=""
+    CNODE=""
+    CPORT=""
+    CFP=""
+    if ! resolve_or_spawn; then
+        SPAWN_FAILED=1
+        return 1
+    fi
+    run_ssh_attach "$CNODE" "$CPORT" "${CFP:-}" "$@"
+    return $?
+}
+
+want_admin_pod() {
+    [[ "$SESSION_MODE" == "login" ]] || return 1
+    [[ "$FORCE_HOST" == "1" || "$FORCE_CONTAINER" == "1" ]] && return 1
+    user_in_group_list "$GATEWAY_BYPASS_GROUPS" || return 1
+    if [[ "$CLI_FORCE_ADMIN" == "1" || "${LOGINBOX_FORCE_ADMIN:-0}" == "1" ]]; then
+        return 0
+    fi
+    [[ "$ADMIN_POD_ENABLED" == "1" ]]
+}
+
+if [[ "$CLI_FORCE_ADMIN" == "1" || "${LOGINBOX_FORCE_ADMIN:-0}" == "1" ]]; then
+    if ! user_in_group_list "$GATEWAY_BYPASS_GROUPS"; then
+        echo "ERROR: ${TARGET_USER} is not authorized for an admin root pod (${GATEWAY_BYPASS_GROUPS})." >&2
+        exit 1
+    fi
 fi
 
-# Cold / Recovery Path: discover from squeue or spawn new container job, then attach
-JID=""
-CNODE=""
-CPORT=""
-CFP=""
-resolve_or_spawn || exit 1
-run_ssh_attach "$CNODE" "$CPORT" "${CFP:-}" "$@"
-exit $?
+if want_admin_pod; then
+    SESSION_MODE="admin"
+    apply_session_route
+    maybe_print_motd "$@"
+    attach_routed_session "$@"
+    rc=$?
+    if [[ "$SPAWN_FAILED" == "1" || "$rc" -eq 255 ]]; then
+        echo "Admin root pod unavailable; falling back to the gateway host shell." >&2
+        SESSION_MODE="login"
+        enter_gateway_host "$@"
+    fi
+    exit "$rc"
+fi
+
+if [[ "$SESSION_MODE" == "login" && "$FORCE_CONTAINER" != "1" ]] && user_in_group_list "$GATEWAY_BYPASS_GROUPS"; then
+    enter_gateway_host "$@"
+fi
+
+apply_session_route
+maybe_print_motd "$@"
+attach_routed_session "$@"
+rc=$?
+if [[ "$SPAWN_FAILED" == "1" ]]; then
+    exit 1
+fi
+exit "$rc"

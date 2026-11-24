@@ -26,11 +26,18 @@ ports required) and is dispatched by the gateway suite in [`gateway/`](gateway/)
      validated against shell-metacharacter smuggling, and executed directly on
      the gateway node (sharing `/home`, `/scratch`, `/projects`, `/cache`,
      `/cvmfs`) inside a per-user transient cgroup (`loginbox-xfer.slice`).
-3. **Gateway Admin Bypass (`gateway-admins` / `ccstaff`):**
-   * Users in `GATEWAY_BYPASS_GROUPS` drop directly onto the gateway host with
-     PTY `/dev/pts/*` ownership, forwarded X11/SSH-agent sockets, and
-     `NOPASSWD` sudo. Admins can still enter or test containers anytime via
-     `enter-login-job` (`LOGINBOX_FORCE_CONTAINER=1`).
+3. **Gateway Admin Root Pod (`gateway-admins` / `ccstaff`):**
+   * When `ADMIN_POD_ENABLED=1`, members of `GATEWAY_BYPASS_GROUPS` get a
+     persistent `admin-<user>` Slurm pod instead of a shell on the gateway.
+     The job is submitted as UID 0 with `ENROOT_ALLOW_SUPERUSER`, so the pod
+     has no user namespace. It bind-mounts all of `/home`, `/scratch`,
+     `/projects`, `/project`, `/cache`, and `/cvmfs`, plus the SSSD sockets,
+     and the admin lands as themselves with `NOPASSWD` sudo so they can
+     `sudo -i` and `su - <otheruser>`.
+   * If the pod cannot be allocated or the attach fails, the session falls
+     back to the gateway host (PTY ownership, X11, SSH agent). `ssh host host`
+     or `enter-login-job --host` forces that host shell. `ssh host container`
+     or `enter-login-job` still opens the unprivileged `login-<user>` pod.
 4. **Port-22 Robot Automation (`robot-<user>`):**
    * External public keys on `:22` are accepted **only** for members of
      `ROBOT_GROUP` (`mfa-automation-users`) whose keys pass
@@ -51,6 +58,9 @@ ports required) and is dispatched by the gateway suite in [`gateway/`](gateway/)
   `zz-cvmfs.sh` — Public Ubuntu 24.04 login container image (`openssh-server`,
   `xauth`, Slurm client DEBs, Pyxis SPANK plugin, OpenMPI, Lmod/CVMFS hook,
   development & debugging tools).
+* `admin-pod/` — Privileged fork of that image (`sudo`, admin sshd entrypoint)
+  used by `admin-<user>` jobs. Built with
+  `docker build -f admin-pod/Dockerfile .`.
 * `gateway/bin/` & `gateway/sbin/` — Host routing & key-filtering scripts
   (`switch-user.sh`, `login-spawn.sh`, `login-stop.sh`, `login-helper.sh`,
   `enter-login-job`, `loginbox-authorized-keys`,
@@ -76,11 +86,18 @@ domain, and site IP is injected at runtime — see [SECRETS.md](SECRETS.md).
 # 1. Import the container image onto shared fast storage (use a versioned filename to avoid NFS ESTALE)
 enroot import -o /cache/slurm-enroot-login-v2.sqsh docker://rkhoja/slurm-enroot-login:latest
 
+# 1b. Optional admin root pod image (only needed when ADMIN_POD_ENABLED=1)
+enroot import -o /cache/slurm-enroot-login-admin.sqsh docker://rkhoja/slurm-enroot-login:admin
+
 # 2. Install gateway scripts & configuration on login gateway nodes
 install -d -m 0755 /etc/loginbox
 cp gateway/etc/loginbox/loginbox.conf.example /etc/loginbox/loginbox.conf
 install -m 0755 container-sshd-entrypoint /etc/loginbox/container-sshd-entrypoint.sh
+install -m 0755 admin-pod/admin-container-sshd-entrypoint /etc/loginbox/admin-container-sshd-entrypoint.sh
 install -m 0755 gateway/bin/* /usr/local/bin/
 install -m 0755 gateway/sbin/* /usr/local/sbin/
 systemctl enable --now loginbox-keygen.service
 ```
+
+The admin partition must allow root jobs (`DisableRootJobs=NO`). Leave
+`ADMIN_POD_ENABLED=0` until that partition and the admin image are in place.
