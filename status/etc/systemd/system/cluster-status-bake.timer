@@ -1,0 +1,11 @@
+[Unit]
+Description=Re-bake cluster-status Slurm snapshot cache every 10 minutes
+
+[Timer]
+OnBootSec=1min
+OnCalendar=*:0/10
+RandomizedDelaySec=60
+Persistent=false
+
+[Install]
+WantedBy=timers.target

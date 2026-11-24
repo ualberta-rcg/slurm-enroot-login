@@ -1,0 +1,23 @@
+# /etc/ssh/sshd_config.d/robot.conf
+# Alliance MFA Automation ("robot") gateway policy (robot.<cluster>):
+#   - Accepts ONLY SSH keys stored in CCDB/LDAP (AuthorizedKeysFile /dev/null).
+#   - Enforces membership in `mfa-automation-users` (`ROBOT_GROUP`).
+#   - Validates all 3 mandatory Alliance constraints (`restrict`, public IP
+#     `from="x.y.z.*"`, and `command="..."`) via sss_ssh_authorizedkeys.filter.
+#   - Rewrites `command="<cmd>"` in memory to `dispatch --robot -- <cmd>` so
+#     OpenSSH enforces `restrict` (no PTY, no forwarding) natively while
+#     file transfers stay on the gateway and batch/workflow commands run inside
+#     the per-user `robot-<user>` Slurm pod.
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+AuthorizedKeysFile /dev/null
+AuthorizedKeysCommand /usr/local/sbin/sss_ssh_authorizedkeys.filter --rewrite-dispatch %u
+AuthorizedKeysCommandUser nobody
+AuthenticationMethods publickey
+ExposeAuthInfo yes
+UseDNS no
+
+# Optional: sites that synchronize `mfa-automation-users` to a Duo Bypass group
+# on a separate Duo integration key may keep Duo enabled instead:
+# KbdInteractiveAuthentication yes
+# AuthenticationMethods publickey,keyboard-interactive:pam

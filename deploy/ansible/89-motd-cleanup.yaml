@@ -1,0 +1,27 @@
+---
+# 89-motd-cleanup.yaml — Remove stock OS /etc/update-motd.d scripts so
+# cluster-status (/etc/profile.d/zz-cluster-status.sh) owns the login banner.
+- name: Clean up /etc/update-motd.d on login gateway nodes
+  hosts: localhost
+  connection: local
+  become: true
+
+  vars:
+    motd_keep_pattern: "cluster_*"
+
+  tasks:
+    - name: Find stock /etc/update-motd.d scripts
+      ansible.builtin.find:
+        paths: /etc/update-motd.d
+        file_type: file
+        patterns: "*"
+        excludes: "{{ motd_keep_pattern }}"
+      register: motd_files_to_delete
+
+    - name: Remove stock /etc/update-motd.d scripts
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ motd_files_to_delete.files }}"
+      loop_control:
+        label: "{{ item.path }}"

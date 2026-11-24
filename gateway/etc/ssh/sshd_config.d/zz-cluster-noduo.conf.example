@@ -1,7 +1,0 @@
-# /etc/ssh/sshd_config.d/zz-cluster-noduo.conf
-# Internal cluster SSH (Open OnDemand Shell app, compute nodes, peer login nodes):
-# Adjust CIDRs to match your internal management / Slurm / storage networks.
-Match Address 10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,127.0.0.0/8
-    AuthenticationMethods publickey
-    AuthorizedKeysCommand /usr/local/sbin/loginbox-authorized-keys internal %u
-    AuthorizedKeysCommandUser root

@@ -1,0 +1,17 @@
+# /etc/slurm/slurm.conf — login partition & Pyxis/job_container settings
+# Merge these directives into your cluster's slurm.conf.
+
+# Isolate /tmp and /dev/shm per Slurm job (including login/robot/admin pods)
+JobContainerType=job_container/tmpfs
+PrologFlags=Contain,X11
+
+# Enable Pyxis SPANK plugin on compute/login-pod nodes and controller
+PlugStackConfig=/etc/slurm/plugstack.conf
+
+# Ephemeral port range for interactive srun steps launched from inside login pods
+SrunPortRange=60001-63000
+
+# Dedicated partition for persistent per-user login, robot, and optional admin pods.
+# Set DisableRootJobs=NO only when ADMIN_POD_ENABLED=1 is used on this partition.
+Nodeset=login_pods Feature=logincap
+PartitionName=login Nodes=login_pods Default=NO MaxTime=7-00:00:00 State=UP OverSubscribe=NO

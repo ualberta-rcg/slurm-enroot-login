@@ -1,23 +1,13 @@
 # =============================================================================
-# Build and Push slurm-enroot-login Image
+# Build and Push slurm-login-pods Images (User + Admin)
 # =============================================================================
-# Builds the portable login userland image and pushes it to Docker Hub,
-# following the same pattern as vulcan-slurm / warewulf-slurmd:
-#   - vars.DOCKER_HUB_REPO, vars.DOCKER_HUB_USER, secrets.DOCKER_HUB_TOKEN
-#   - version derived from the DEBs (no API calls), input override wins
+# Builds the portable login userland and admin root pod images and pushes them
+# to Docker Hub (using vars/secrets DOCKER_HUB_REPO, DOCKER_HUB_USER,
+# secrets.DOCKER_HUB_TOKEN).
 #
-# Slurm client DEBs are staged from the public ualberta-rcg/warewulf-slurmd
-# repo (newest *_u2404 version) — single source of truth for Slurm builds.
-#
-# Triggers: push to main touching the image sources, or manual dispatch.
-# Tags pushed: <repo>:<version> (pinned) and <repo>:latest (floating).
-# Note: ENTRYPOINT is login-shell; smoke tests use --entrypoint overrides.
-#
-# Required repo configuration (Settings → Secrets and variables → Actions):
-#   DOCKER_HUB_REPO and DOCKER_HUB_USER — as repo Variables OR Secrets
-#   (mixed is fine; each name is read from whichever location holds it):
-#     e.g. rkhoja/slurm-enroot-login and rkhoja
-#   secrets.DOCKER_HUB_TOKEN  Read/Write access token
+# Tags pushed:
+#   <repo>:<version>, <repo>:latest
+#   <repo>:admin-<version>, <repo>:admin
 # =============================================================================
 name: Build and Push Login Image
 
@@ -32,15 +22,10 @@ on:
     branches:
       - main
     paths:
-      - 'Dockerfile'
-      - 'login-shell'
-      - 'slurm-login-shell'
-      - 'container-sshd-entrypoint'
-      - 'admin-pod/**'
+      - 'images/**'
+      - 'status/**'
+      - 'agent-guardrails/**'
       - '.github/workflows/build-push-workflow.yml'
-  # Self-rebuild: warewulf-slurmd builds new Slurm DEBs Mondays ~02:00 UTC
-  # and its images ~03:00; we check Tuesdays and pick up whatever is newest.
-  # Skips cleanly when the version tag is already on Docker Hub.
   schedule:
     - cron: '23 4 * * 2'
 
@@ -59,13 +44,11 @@ jobs:
       - name: 🛡️ Fail fast if Docker Hub configuration is missing
         run: |
           MISSING=""
-          # vulcan-slurm uses vars.*, warewulf-slurmd uses secrets.* — accept either
           [ -z "${{ secrets.DOCKER_HUB_REPO || vars.DOCKER_HUB_REPO }}" ] && MISSING="$MISSING DOCKER_HUB_REPO (vars or secrets)"
           [ -z "${{ secrets.DOCKER_HUB_USER || vars.DOCKER_HUB_USER }}" ] && MISSING="$MISSING DOCKER_HUB_USER (vars or secrets)"
           [ -z "${{ secrets.DOCKER_HUB_TOKEN }}" ] && MISSING="$MISSING secrets.DOCKER_HUB_TOKEN"
           if [ -n "$MISSING" ]; then
             echo "❌ Missing repository configuration:$MISSING"
-            echo "   Set them under Settings → Secrets and variables → Actions."
             exit 1
           fi
           echo "✅ Docker Hub configuration present."
@@ -73,11 +56,12 @@ jobs:
       - name: 🛠️ Checkout Repository
         uses: actions/checkout@v4
 
+      - name: 🔍 Scan for secrets, credentials, and PII
+        run: python3 tests/scan_secrets_pii.py
+
       - name: 🎯 Determine Slurm Version & Stage DEBs
         run: |
           set -e
-          # Clone the sibling repo and take the newest u2404 DEB set —
-          # plain git, no API rate limits.
           git clone --depth 1 https://github.com/ualberta-rcg/warewulf-slurmd /tmp/ww
           if [ -n "${{ github.event.inputs.SLURM_VERSION_OVERRIDE }}" ]; then
             VERSION="${{ github.event.inputs.SLURM_VERSION_OVERRIDE }}"
@@ -93,11 +77,9 @@ jobs:
 
           mkdir -p debs
           cp /tmp/ww/slurm-debs/*_${VERSION}_*_u2404.deb debs/ 2>/dev/null || true
-          ls -la debs/ | head -20
           [ -f "debs/slurm-smd_${VERSION}_amd64_u2404.deb" ] || { echo "❌ slurm-smd ${VERSION} DEB not found."; exit 1; }
           [ -f "debs/slurm-smd-client_${VERSION}_amd64_u2404.deb" ] || { echo "❌ slurm-smd-client ${VERSION} DEB not found."; exit 1; }
 
-          # Scheduled runs skip when this version is already published
           if [ "${{ github.event_name }}" = "schedule" ] \
              && curl -sf "https://hub.docker.com/v2/repositories/$DOCKER_REPO/tags/$VERSION" > /dev/null; then
             echo "⏭️ Slurm $VERSION already published; nothing new. Skipping."
@@ -105,36 +87,37 @@ jobs:
             exit 0
           fi
 
-      - name: 🐳 Build Image
+      - name: 🐳 Build User Image
         if: env.skip != 'true'
         run: |
           set -o pipefail
-          docker build -t $DOCKER_REPO:${{ env.version }} . 2>&1 | tee /tmp/build.log || {
+          docker build -f images/user/Dockerfile --build-arg IMAGE_VERSION="${{ env.version }}" -t $DOCKER_REPO:${{ env.version }} . 2>&1 | tee /tmp/build.log || {
             echo "::error::build failed: $(grep -vE '^ #[0-9]+ \[|^ *[0-9]+ \||^>>>|^ ---$' /tmp/build.log | tail -n8 | tr '\n' ' ' | cut -c1-800)"
             exit 1
           }
           docker tag $DOCKER_REPO:${{ env.version }} $DOCKER_REPO:latest
 
-      - name: 🐳 Smoke Test Image
+      - name: 🧪 Smoke Test User Image
         if: env.skip != 'true'
         run: |
-          # Slurm 26.05 clients need a config source before any operation;
-          # real deployments bind-mount the configless cache, tests supply one.
-          printf 'ClusterName=seltest\nSlurmctldHost=localhost(127.0.0.1)\nPlugStackConfig=/etc/slurm/plugstack.conf\n' > test-slurm.conf
+          set -e
+          printf 'ClusterName=slptest\nSlurmctldHost=localhost(127.0.0.1)\nPlugStackConfig=/etc/slurm/plugstack.conf\n' > test-slurm.conf
           CONFMNT="-v $PWD/test-slurm.conf:/etc/slurm/slurm.conf:ro"
+          docker run --rm --entrypoint test $DOCKER_REPO:latest -s /etc/slurm-login-pods-release
           docker run --rm $CONFMNT --entrypoint srun $DOCKER_REPO:latest --version
           docker run --rm $CONFMNT --entrypoint sbatch $DOCKER_REPO:latest --version
           docker run --rm --entrypoint test $DOCKER_REPO:latest -x /usr/local/bin/login-shell
           docker run --rm --entrypoint test $DOCKER_REPO:latest -x /usr/local/bin/container-sshd-entrypoint
-          docker run --rm --entrypoint bash $DOCKER_REPO:latest -lc 'command -v mpirun && command -v module && command -v sshd && command -v xauth'
+          docker run --rm --entrypoint bash $DOCKER_REPO:latest -c 'test -L /usr/libexec/openssh/sftp-server && test -x /usr/libexec/openssh/sftp-server'
+          docker run --rm --entrypoint bash $DOCKER_REPO:latest -lc 'command -v sq && command -v login-pod && cluster-status --plain --only header'
+          docker run --rm --entrypoint bash $DOCKER_REPO:latest -c 'test -s /etc/claude-code/CLAUDE.md && test -d /etc/claude-code/.claude/skills/alliance-slurm'
           docker run --rm --entrypoint bash $DOCKER_REPO:latest -c 'ls /etc/ssh/ssh_host_* >/dev/null 2>&1 && exit 1 || exit 0'
-          docker run --rm --entrypoint bash $DOCKER_REPO:latest /usr/local/bin/login-shell -c 'echo scrub-ok'
 
       - name: 🐳 Build Admin Image
         if: env.skip != 'true'
         run: |
           set -o pipefail
-          docker build -f admin-pod/Dockerfile -t $DOCKER_REPO:admin-${{ env.version }} . 2>&1 | tee /tmp/admin-build.log || {
+          docker build -f images/admin/Dockerfile --build-arg IMAGE_VERSION="${{ env.version }}" -t $DOCKER_REPO:admin-${{ env.version }} . 2>&1 | tee /tmp/admin-build.log || {
             echo "::error::admin build failed: $(grep -vE '^ #[0-9]+ \[|^ *[0-9]+ \||^>>>|^ ---$' /tmp/admin-build.log | tail -n8 | tr '\n' ' ' | cut -c1-800)"
             exit 1
           }
@@ -143,8 +126,11 @@ jobs:
       - name: 🧪 Smoke Test Admin Image
         if: env.skip != 'true'
         run: |
+          set -e
+          docker run --rm --entrypoint test $DOCKER_REPO:admin -s /etc/slurm-login-pods-release
           docker run --rm --entrypoint test $DOCKER_REPO:admin -x /usr/local/bin/admin-container-sshd-entrypoint
           docker run --rm --entrypoint test $DOCKER_REPO:admin -x /usr/local/bin/admin-login-shell
+          docker run --rm --entrypoint bash $DOCKER_REPO:admin -c 'test -L /usr/libexec/openssh/sftp-server && test -x /usr/libexec/openssh/sftp-server'
           docker run --rm --entrypoint bash $DOCKER_REPO:admin -lc 'command -v sudo && command -v su && command -v sshd'
           docker run --rm --entrypoint bash $DOCKER_REPO:admin -c 'find /lib /usr/lib -name pam_sss.so | grep -q pam_sss'
           docker run --rm --entrypoint bash $DOCKER_REPO:admin -c 'test -f /etc/sudoers.d/gateway-admins && visudo -cf /etc/sudoers.d/gateway-admins'

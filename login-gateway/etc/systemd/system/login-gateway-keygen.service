@@ -1,0 +1,17 @@
+[Unit]
+Description=Generate gateway-to-pod SSH proxy keypair on first boot
+DefaultDependencies=no
+After=local-fs.target
+Before=ssh.service sshd.service
+ConditionPathExists=!/etc/login-gateway/proxy_id_ed25519
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/mkdir -p /etc/login-gateway
+ExecStart=/bin/sh -c 'if [ -f /etc/loginbox/proxy_id_ed25519 ]; then cp -a /etc/loginbox/proxy_id_ed25519 /etc/loginbox/proxy_id_ed25519.pub /etc/login-gateway/; else /usr/bin/ssh-keygen -q -t ed25519 -f /etc/login-gateway/proxy_id_ed25519 -N "" -C "login-gateway-proxy"; fi'
+ExecStart=/bin/chmod 0600 /etc/login-gateway/proxy_id_ed25519
+ExecStart=/bin/chmod 0644 /etc/login-gateway/proxy_id_ed25519.pub
+
+[Install]
+WantedBy=multi-user.target

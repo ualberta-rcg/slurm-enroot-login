@@ -1,0 +1,15 @@
+# Optional site-specific AI agent notes (/etc/agents/site.md)
+#
+# Copy to /etc/agents/site.md inside your site's Warewulf overlay or host /etc
+# (bind-mounted read-only into login pods when present) to give coding agents
+# accurate local cluster facts without editing the generic AGENTS.md/CLAUDE.md.
+#
+# Example:
+#
+# ## Site Cluster Facts
+# - **Cluster**: example-cluster
+# - **Login pod limits**: 4 CPUs, 4 GB RAM, 7-day walltime
+# - **Partitions**: `compute` (default, 60-min default walltime)
+# - **GPUs**: `--gres=gpu:l40s:1` (full GPU)
+# - **Open OnDemand**: https://ondemand.example.edu
+# - **Support**: support@example.edu

@@ -1,0 +1,41 @@
+#!/bin/bash
+# /usr/local/bin/diskusage_report — Alliance-compatible filesystem usage summary
+set -euo pipefail
+
+USER_NAME="${USER:-$(id -un)}"
+HOME_PATH="${HOME:-/home/${USER_NAME}}"
+SCRATCH_PATH="${SCRATCH:-/scratch/${USER_NAME}}"
+
+printf '%-28s %10s %10s %10s %6s\n' "Filesystem / Path" "Used" "Avail" "Total" "Use%"
+printf '%-28s %10s %10s %10s %6s\n' "----------------------------" "----------" "----------" "----------" "------"
+
+report_path() {
+    local label="$1" target="$2"
+    [[ -d "$target" ]] || return 0
+    local line
+    line=$(timeout 3 df -Ph "$target" 2>/dev/null | awk 'NR==2 {print $2"|"$3"|"$4"|"$5}' || true)
+    [[ -z "$line" ]] && return 0
+    IFS="|" read -r total used avail pct <<< "$line"
+    printf '%-28s %10s %10s %10s %6s\n' "$label" "$used" "$avail" "$total" "$pct"
+}
+
+report_path "home (${HOME_PATH})" "$HOME_PATH"
+report_path "scratch (${SCRATCH_PATH})" "$SCRATCH_PATH"
+
+SEEN=" "
+for base in /projects /project "${HOME_PATH}/projects"; do
+    [[ -d "$base" ]] || continue
+    for entry in "$base"/*; do
+        [[ -d "$entry" ]] || continue
+        real_p=$(readlink -f "$entry" 2>/dev/null || echo "$entry")
+        [[ "$SEEN" == *" ${real_p} "* ]] && continue
+        if [[ "$base" != "${HOME_PATH}/projects" ]]; then
+            bname=$(basename "$entry")
+            if [[ "$bname" != "$USER_NAME" && " $(id -Gn 2>/dev/null || true) " != *" ${bname} "* ]]; then
+                continue
+            fi
+        fi
+        SEEN+="${real_p} "
+        report_path "project ($(basename "$entry"))" "$real_p"
+    done
+done

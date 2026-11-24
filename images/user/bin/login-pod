@@ -1,0 +1,71 @@
+#!/bin/bash
+# /usr/local/bin/login-pod — inspect, restart, or stop your persistent login pod
+set -euo pipefail
+
+usage() {
+    cat << 'EOF'
+Usage: login-pod [status|restart|stop|--help]
+
+Commands:
+  status    Show your current login pod's Slurm job ID, node, resources,
+            remaining walltime, and mounted project directories (default).
+  restart   End this login pod so your next SSH connection starts a fresh pod
+            (use after being added to a new project group or image update).
+  stop      Stop this login pod immediately and close all sessions inside it.
+EOF
+}
+
+ACTION="${1:-status}"
+USER_NAME=$(id -un)
+JID="${LOGIN_JOB_ID:-}"
+
+if [[ -z "$JID" ]] && command -v squeue >/dev/null 2>&1; then
+    JID=$(squeue -h -u "$USER_NAME" -n "login-${USER_NAME}" -t R -o "%i" 2>/dev/null | head -n 1 || true)
+fi
+
+case "$ACTION" in
+    -h|--help|help)
+        usage
+        exit 0
+        ;;
+    status)
+        if [[ -z "$JID" ]]; then
+            echo "Not currently attached to a Slurm login pod (host=$(hostname -s))."
+            exit 0
+        fi
+        INFO=$(squeue -h -j "$JID" -o "%i|%j|%P|%N|%C|%m|%M|%L" 2>/dev/null | head -n 1 || true)
+        if [[ -z "$INFO" ]]; then
+            echo "Login pod job ${JID} is no longer listed in squeue."
+            exit 0
+        fi
+        IFS="|" read -r j_id j_name j_part j_node j_cpus j_mem j_used j_left <<< "$INFO"
+        printf 'Pod hostname : %s\n' "$(hostname)"
+        printf 'Slurm job    : %s (%s on partition %s, node %s)\n' "$j_id" "$j_name" "$j_part" "${LOGIN_POD_NODE:-$j_node}"
+        printf 'Allocation   : %s CPUs, %s RAM\n' "$j_cpus" "$j_mem"
+        printf 'Walltime     : %s elapsed, %s remaining\n' "$j_used" "$j_left"
+        printf 'Groups       : %s\n' "$(id -Gn)"
+        exit 0
+        ;;
+    restart)
+        if [[ -z "$JID" ]]; then
+            echo "No active login pod job found for ${USER_NAME}." >&2
+            exit 1
+        fi
+        echo "Restarting login pod ${JID}: this SSH session will close now."
+        echo "Reconnect via SSH to launch a fresh login pod with updated group mounts."
+        exec scancel "$JID"
+        ;;
+    stop)
+        if [[ -z "$JID" ]]; then
+            echo "No active login pod job found for ${USER_NAME}." >&2
+            exit 1
+        fi
+        echo "Stopping login pod ${JID}..."
+        exec scancel "$JID"
+        ;;
+    *)
+        echo "login-pod: unknown command '${ACTION}'" >&2
+        usage >&2
+        exit 2
+        ;;
+esac

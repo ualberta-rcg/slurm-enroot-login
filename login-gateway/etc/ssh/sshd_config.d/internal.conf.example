@@ -1,0 +1,8 @@
+# /etc/ssh/sshd_config.d/internal.conf
+# Internal cluster SSH (Open OnDemand Shell app, compute nodes, peer gateways):
+# Skips Duo MFA for trusted internal RFC1918 networks while keeping ForceCommand
+# pod routing active. Adjust CIDRs to match your internal cluster networks.
+Match Address 10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,127.0.0.0/8
+    AuthenticationMethods publickey
+    AuthorizedKeysCommand /usr/local/sbin/login-gateway-authorized-keys internal %u
+    AuthorizedKeysCommandUser root

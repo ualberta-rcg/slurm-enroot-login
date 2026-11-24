@@ -1,0 +1,59 @@
+#!/bin/bash
+# =============================================================================
+# login-shell — entrypoint for the slurm-login-pods user image
+# =============================================================================
+# Verifies image containment, scrubs SLURM_*/PMI*/MPI*/module variables so
+# srun/salloc/sbatch/mpirun inside the login pod behave identically to a
+# traditional login node, creates a private 0700 XDG_RUNTIME_DIR in /tmp, and
+# starts the user's login shell in $HOME.
+# =============================================================================
+set -u
+
+if [[ ! -f /etc/slurm-login-pods-release ]]; then
+    echo "CRITICAL: /etc/slurm-login-pods-release missing — refusing to run uncontained." >&2
+    exit 1
+fi
+if [[ -n "${SLURM_JOB_ID:-}" && "$(cat /proc/1/comm 2>/dev/null || true)" == "systemd" ]]; then
+    if [[ "$(readlink /proc/self/ns/mnt 2>/dev/null || true)" == "$(readlink /proc/1/ns/mnt 2>/dev/null || true)" ]]; then
+        echo "CRITICAL: Mount namespace matches host systemd PID 1 — refusing to run uncontained." >&2
+        exit 1
+    fi
+fi
+
+export LOGIN_JOB_ID="${SLURM_JOB_ID:-${LOGIN_JOB_ID:-}}"
+
+KEEP_CONF="${SLURM_CONF:-}"
+for v in $(compgen -e); do
+    case "$v" in
+        SLURM_*|SLURMD_*|PMI_*|PMIX_*|OMPI_*|I_MPI_*|HYDRA_*) unset "$v" ;;
+        MODULEPATH*|MODULERCFILE|MODULESHOME|LMOD_*|_LMOD*|MODULES_*|_ModuleTable*|__Init_Default_Modules) unset "$v" ;;
+    esac
+done
+
+if [[ -n $KEEP_CONF && -f $KEEP_CONF ]]; then
+    export SLURM_CONF="$KEEP_CONF"
+elif [[ -f /etc/slurm/slurm.conf ]]; then
+    unset SLURM_CONF
+else
+    export SLURM_CONF=/run/slurm/conf/slurm.conf
+    mkdir -p /run/slurm/conf 2>/dev/null || true
+    sackd -d --conf-server "${SLURM_CONF_SERVER:-slurmctld-1:6817,slurmctld-2:6817,slurmctld-3:6817}" \
+        --conf-cache /run/slurm/conf 2>/dev/null || true
+    for _ in $(seq 1 10); do [[ -f $SLURM_CONF ]] && break; sleep 1; done
+fi
+
+# Private 0700 XDG_RUNTIME_DIR in job /tmp
+XDG_RT="/tmp/run-$(id -u)"
+mkdir -p "$XDG_RT" 2>/dev/null && chmod 700 "$XDG_RT" 2>/dev/null && export XDG_RUNTIME_DIR="$XDG_RT"
+
+export OMPI_MCA_rmaps_base_oversubscribe=1
+
+cd "${HOME:-/tmp}" 2>/dev/null || cd /tmp
+
+if [[ $# -eq 0 ]]; then
+    exec "${SHELL:-/bin/bash}" -l
+elif [[ $1 == -* ]]; then
+    exec "${SHELL:-/bin/bash}" -l "$@"
+else
+    exec "$@"
+fi

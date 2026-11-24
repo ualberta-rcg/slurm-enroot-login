@@ -1,0 +1,98 @@
+#!/bin/bash
+# /usr/local/libexec/login-gateway/stop
+# Stops a user's login-<user>, robot-<user>, and/or admin-<user> Slurm pod
+# and cleans up cached routing metadata and transient systemd units.
+set -euo pipefail
+
+for candidate_conf in \
+    "${LOGIN_GATEWAY_CONF:-}" \
+    "/etc/login-gateway/login-gateway.conf" \
+    "/etc/loginbox/loginbox.conf"; do
+    if [[ -n "$candidate_conf" && -r "$candidate_conf" ]]; then
+        # shellcheck disable=SC1090
+        source "$candidate_conf"
+        break
+    fi
+done
+
+LOGIN_PARTITION="${LOGIN_PARTITION:-login}"
+ADMIN_PARTITION="${ADMIN_PARTITION:-$LOGIN_PARTITION}"
+TARGET_USER=""
+MODE="all"
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --user|-u)
+            TARGET_USER="${2:-}"
+            shift 2
+            ;;
+        --mode|-m)
+            MODE="${2:-all}"
+            shift 2
+            ;;
+        *)
+            if [[ -z "$TARGET_USER" ]]; then
+                TARGET_USER="$1"
+            fi
+            shift
+            ;;
+    esac
+done
+
+if [[ -z "$TARGET_USER" || ! "$TARGET_USER" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+    echo "Usage: stop --user <username> [--mode all|login|robot|admin]" >&2
+    exit 1
+fi
+
+stop_one_mode() {
+    local m="$1"
+    local job_name route_name unit_prefix owner part
+    if [[ "$m" == "robot" ]]; then
+        job_name="robot-${TARGET_USER}"
+        route_name="robot-${TARGET_USER}"
+        unit_prefix="robot-${TARGET_USER}"
+        owner="$TARGET_USER"
+        part="$LOGIN_PARTITION"
+    elif [[ "$m" == "admin" ]]; then
+        job_name="admin-${TARGET_USER}"
+        route_name="admin-${TARGET_USER}"
+        unit_prefix="admin-${TARGET_USER}"
+        owner="root"
+        part="$ADMIN_PARTITION"
+    else
+        job_name="login-${TARGET_USER}"
+        route_name="${TARGET_USER}"
+        unit_prefix="salloc-${TARGET_USER}"
+        owner="$TARGET_USER"
+        part="$LOGIN_PARTITION"
+    fi
+
+    rm -f "/run/login-gateway/routes/${route_name}" "/run/loginbox/routes/${route_name}" 2>/dev/null || true
+
+    local jids
+    jids=$(squeue -h -u "$owner" -p "$part" -n "$job_name" -o "%i" 2>/dev/null || true)
+    if [[ -n "$jids" ]]; then
+        for j in $jids; do
+            scancel "$j" 2>/dev/null || su -s /bin/bash "$TARGET_USER" -c "scancel $j" 2>/dev/null || true
+            echo "Stopped Slurm pod ${job_name} (JobId=${j})."
+        done
+    fi
+
+    if [[ "$(id -u)" -eq 0 ]]; then
+        for pfx in "login-gateway" "loginbox"; do
+            systemctl stop "${pfx}-${unit_prefix}.service" 2>/dev/null || true
+            systemctl reset-failed "${pfx}-${unit_prefix}.service" 2>/dev/null || true
+        done
+    fi
+}
+
+case "$MODE" in
+    login) stop_one_mode login ;;
+    robot) stop_one_mode robot ;;
+    admin) stop_one_mode admin ;;
+    all|*)
+        stop_one_mode login
+        stop_one_mode robot
+        stop_one_mode admin
+        ;;
+esac

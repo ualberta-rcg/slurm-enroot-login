@@ -1,0 +1,50 @@
+# /etc/cluster-status/motd.conf — site configuration for cluster-status.
+# Plain sourced shell (root-owned 0644). All values shown are neutral defaults.
+
+# Short cluster name shown in the banner header
+#CLUSTER_NAME=cluster
+
+# Site branding lines shown under the ASCII logo (set to "" to omit)
+#SITE_TITLE="Digital Research Alliance of Canada"
+#SITE_SUBTITLE=""
+
+# Optional custom ASCII logo file (replaces built-in generic logo when non-empty)
+#LOGO_FILE=/etc/cluster-status/logo.txt
+
+# Optional custom links file ("Label:|https://example.org" per line)
+#LINKS_FILE=/etc/cluster-status/links.txt
+
+# Free-form notices file; rendered under "» Notice" when non-empty
+#ANNOUNCE=/etc/cluster-status/announce.txt
+
+# Partition hosting persistent login/robot/admin pods (excluded from batch counts)
+#LOGIN_PARTITION=login
+
+# Max rows in "» Your jobs" and "» Storage"
+#MAX_JOBS=3
+#MAX_PROJECTS=3
+#WIDE_MIN=70
+
+# Storage base paths
+#HOME_BASE=/home
+#SCRATCH_BASE=/scratch
+
+# Fairshare & storage color thresholds
+#FS_BOOST=0.80
+#FS_AHEAD=0.60
+#FS_NOMINAL=0.40
+#FS_BEHIND=0.20
+#LFS_LOW=0.75
+#LFS_HIGH=1.25
+#DISK_MID=33
+#DISK_HIGH=66
+#Q_TIMEOUT=3
+
+# Cache paths:
+# Inside login pods, container-sshd-entrypoint sets CLUSTER_STATUS_CACHE_DIR=/tmp/cluster-status
+# and refreshes it every ~10m with per-UID jitter. On gateway hosts, cluster-status-bake.timer
+# writes to /run/cluster-status.
+#CACHE_DIR=/run/cluster-status
+#CLUSTER_TTL=900
+#FAIRSHARE_TTL=900
+#STORAGE_TTL=900

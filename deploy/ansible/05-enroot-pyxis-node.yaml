@@ -1,0 +1,61 @@
+---
+# 05-enroot-pyxis-node.yaml — Prepare a Slurm login-partition execution node
+# for unprivileged Enroot + Pyxis per-user login pods.
+- name: Prepare Slurm node for Enroot + Pyxis login pods
+  hosts: localhost
+  connection: local
+  become: true
+
+  vars:
+    image_cache_dir: /cache
+    max_user_namespaces: 65536
+
+  tasks:
+    - name: Install Enroot unprivileged FUSE prerequisites
+      ansible.builtin.apt:
+        name:
+          - squashfuse
+          - fuse-overlayfs
+          - pigz
+          - zstd
+          - jq
+          - curl
+        state: present
+        update_cache: true
+      when: ansible_os_family == "Debian"
+
+    - name: Ensure /var/tmp has sticky world-writable mode 1777 for Enroot/Pyxis
+      ansible.builtin.file:
+        path: /var/tmp
+        state: directory
+        owner: root
+        group: root
+        mode: "1777"
+
+    - name: Ensure shared SquashFS image cache directory exists
+      ansible.builtin.file:
+        path: "{{ image_cache_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Enable unprivileged user namespaces for rootless login-<user> pods
+      ansible.posix.sysctl:
+        name: user.max_user_namespaces
+        value: "{{ max_user_namespaces }}"
+        sysctl_file: /etc/sysctl.d/90-login-pods-userns.conf
+        reload: true
+      failed_when: false
+
+    - name: Configure Enroot defaults for login pods
+      ansible.builtin.copy:
+        dest: /etc/enroot/enroot.conf.d/10-login-pods.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          ENROOT_SQUASH_OPTIONS -noI -noD -noF -noX -no-duplicates
+          ENROOT_MOUNT_HOME no
+          ENROOT_RESTRICT_DEV yes
+          ENROOT_ROOTFS_WRITABLE yes

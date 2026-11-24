@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+# cluster-status-bake — snapshot baker for cluster-status.
+#
+# Runs inside login pods (writing to private /tmp/cluster-status via a jittered
+# 10-minute background loop in container-sshd-entrypoint) and on gateway hosts
+# via cluster-status-bake.timer (/run/cluster-status).
+#
+# Excludes login-only gateway nodes and persistent login/robot/admin pods from
+# compute node and batch queue counts.
+
+set -u
+PATH=/usr/local/bin:/usr/bin:/bin
+
+CONF="${CLUSTER_STATUS_CONF:-/etc/cluster-status/motd.conf}"
+[ -r "$CONF" ] && . "$CONF"
+
+CACHE_DIR=${CLUSTER_STATUS_CACHE_DIR:-${CACHE_DIR:-/run/cluster-status}}
+CLUSTER_OUT=${CLUSTER_CACHE:-$CACHE_DIR/cluster}
+HEARTBEAT_OUT=${HEARTBEAT:-$CACHE_DIR/heartbeat}
+LOGIN_PARTITION=${LOGIN_PARTITION:-login}
+Q_TIMEOUT=${Q_TIMEOUT:-3}
+
+mkdir -p "$CACHE_DIR" 2>/dev/null || exit 0
+if [ "$(id -u)" -eq 0 ]; then
+    chmod 0755 "$CACHE_DIR" 2>/dev/null || true
+else
+    chmod 0700 "$CACHE_DIR" 2>/dev/null || true
+fi
+
+CTLD=0; DBD=0
+if timeout "$Q_TIMEOUT" sinfo -h -o '%D' >/dev/null 2>&1; then CTLD=1; fi
+if timeout "$Q_TIMEOUT" sshare -ahP --noheader -o Account >/dev/null 2>&1; then DBD=1; fi
+
+{
+    printf 'ctld=%d\n' "$CTLD"
+    printf 'dbd=%d\n'  "$DBD"
+} > "$HEARTBEAT_OUT.tmp.$$"
+mv -f "$HEARTBEAT_OUT.tmp.$$" "$HEARTBEAT_OUT" 2>/dev/null
+[ "$(id -u)" -eq 0 ] && chmod 0644 "$HEARTBEAT_OUT" 2>/dev/null || chmod 0600 "$HEARTBEAT_OUT" 2>/dev/null
+
+[ "$CTLD" = 1 ] || exit 0
+
+nodes_up=0 nodes_down=0 cpu_alloc=0 cpu_total=0
+mem_alloc_mb=0 mem_total_mb=0 gpu_alloc=0 gpu_total=0 gpu_usable=0
+queue_r=0 queue_pd=0
+
+s=$(timeout "$((Q_TIMEOUT*2))" scontrol -o show nodes 2>/dev/null)
+if [ -n "$s" ]; then
+    eval "$(printf '%s\n' "$s" | awk -v lp="$LOGIN_PARTITION" '
+        function has_compute_part(parts,   n, a, i) {
+            if (parts == "") return 0
+            n = split(parts, a, ",")
+            for (i = 1; i <= n; i++) if (a[i] != "" && a[i] != lp) return 1
+            return 0
+        }
+        {
+            lines[++nr] = $0
+            for (i = 1; i <= NF; i++) if ($i ~ /^Partitions=/) { split($i, p, "="); if (has_compute_part(p[2])) any_part = 1 }
+        }
+        END {
+            for (r = 1; r <= nr; r++) {
+                $0 = lines[r]
+                parts = ""; st = ""; nrm=nam=cc=ac=cg=ag=0
+                for (i = 1; i <= NF; i++) {
+                    if ($i ~ /^Partitions=/) { split($i,a,"="); parts=a[2] }
+                    if ($i ~ /^State=/)      { split($i,a,"="); st=tolower(a[2]) }
+                    if ($i ~ /^RealMemory=/) { split($i,a,"="); nrm=a[2]+0 }
+                    if ($i ~ /^AllocMem=/)   { split($i,a,"="); nam=a[2]+0 }
+                    if ($i ~ /^CfgTRES=/)    {
+                        if (match($i, /gres\/gpu=[0-9]+/)) { g=substr($i,RSTART+9,RLENGTH-9)+0; cg=g }
+                        if (match($i, /cpu=[0-9]+/))       cc=substr($i,RSTART+4,RLENGTH-4)+0
+                    }
+                    if ($i ~ /^AllocTRES=/)  {
+                        if (match($i, /gres\/gpu=[0-9]+/)) { g=substr($i,RSTART+9,RLENGTH-9)+0; ga=g; ag=g }
+                        if (match($i, /cpu=[0-9]+/))       ac=substr($i,RSTART+4,RLENGTH-4)+0
+                    }
+                }
+                if (any_part && !has_compute_part(parts)) continue
+                if (st ~ /(down|drain|drng|unk|fail|maint)/) d++; else u++
+                tc += cc; tac += ac; trm += nrm; tam += nam; gt += cg; galloc += ag
+                if (cg > 0 && st !~ /(down|drain|drng|unk|fail|maint)/) {
+                    cpu_per = cc/cg; mem_per = (nrm>0 ? nrm/cg : 0)
+                    ug = cg - ag
+                    v = (cpu_per>0 ? int((cc-ac)/cpu_per) : 0)
+                    w = (mem_per>0 ? int((nrm-nam)/mem_per) : 0)
+                    if (v < ug) ug=v; if (w < ug) ug=w
+                    if (ug > 0) usable += ug
+                }
+            }
+            printf "nodes_up=%d nodes_down=%d cpu_alloc=%d cpu_total=%d mem_alloc_mb=%d mem_total_mb=%d gpu_alloc=%d gpu_total=%d gpu_usable=%d\n",
+                   u+0, d+0, tac+0, tc+0, tam+0, trm+0, galloc+0, gt+0, usable+0
+        }')"
+fi
+
+qraw=$(timeout "$Q_TIMEOUT" squeue -h -t R,PD -o '%t|%P|%j' 2>/dev/null || true)
+eval "$(printf '%s\n' "$qraw" | awk -F'|' -v lp="$LOGIN_PARTITION" '
+    NF >= 3 && $2 != lp && $3 !~ /^(login|robot|admin)-/ {
+        if ($1 == "R") r++; else if ($1 == "PD") pd++
+    }
+    END { printf "queue_r=%d queue_pd=%d\n", r+0, pd+0 }')"
+
+{
+    printf 'nodes_up=%d\n'      "$nodes_up"
+    printf 'nodes_down=%d\n'    "$nodes_down"
+    printf 'cpu_alloc=%d\n'     "$cpu_alloc"
+    printf 'cpu_total=%d\n'     "$cpu_total"
+    printf 'mem_alloc_mb=%d\n'  "$mem_alloc_mb"
+    printf 'mem_total_mb=%d\n'  "$mem_total_mb"
+    printf 'gpu_alloc=%d\n'     "$gpu_alloc"
+    printf 'gpu_total=%d\n'     "$gpu_total"
+    printf 'gpu_usable=%d\n'    "$gpu_usable"
+    printf 'queue_r=%d\n'       "$queue_r"
+    printf 'queue_pd=%d\n'      "$queue_pd"
+    printf 'baked_epoch=%d\n'   "$(date +%s)"
+} > "$CLUSTER_OUT.tmp.$$"
+mv -f "$CLUSTER_OUT.tmp.$$" "$CLUSTER_OUT" 2>/dev/null
+[ "$(id -u)" -eq 0 ] && chmod 0644 "$CLUSTER_OUT" 2>/dev/null || chmod 0600 "$CLUSTER_OUT" 2>/dev/null
+
+exit 0

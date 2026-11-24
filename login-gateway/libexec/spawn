@@ -1,0 +1,426 @@
+#!/bin/bash
+# /usr/local/libexec/login-gateway/spawn
+# Allocates a persistent login-<user>, robot-<user>, or admin-<user> Slurm
+# Pyxis/Enroot pod using salloc + srun.
+#   - login/robot run container-sshd-entrypoint as the unprivileged user.
+#   - admin runs admin-container-sshd-entrypoint as Slurm UID 0 with
+#     ENROOT_ALLOW_SUPERUSER=yes (no user namespace so sudo/su see all UIDs).
+#   - Unshares UTS namespace (--container-unshare=uts) when POD_HOSTNAME_TEMPLATE
+#     is configured so each user's pod gets its own hostname without affecting
+#     the physical host or the Slurm job Comment routing metadata.
+#   - Serializes parallel cold connections via per-job flock and cleans up
+#     orphaned PD jobs + transient systemd units on timeout.
+set -euo pipefail
+
+for candidate_conf in \
+    "${LOGIN_GATEWAY_CONF:-}" \
+    "/etc/login-gateway/login-gateway.conf" \
+    "/etc/loginbox/loginbox.conf"; do
+    if [[ -n "$candidate_conf" && -r "$candidate_conf" ]]; then
+        # shellcheck disable=SC1090
+        source "$candidate_conf"
+        break
+    fi
+done
+
+TARGET_USER=""
+TARGET_NODE=""
+MODE="login"
+WAIT_TIMEOUT="${WAIT_TIMEOUT:-60}"
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --user|-u)
+            TARGET_USER="${2:-}"
+            shift 2
+            ;;
+        --node|-w)
+            TARGET_NODE="${2:-}"
+            shift 2
+            ;;
+        --mode|-m)
+            MODE="${2:-login}"
+            shift 2
+            ;;
+        *)
+            if [[ -z "$TARGET_USER" ]]; then
+                TARGET_USER="$1"
+            fi
+            shift
+            ;;
+    esac
+done
+
+if [[ -z "$TARGET_USER" || ! "$TARGET_USER" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+    echo "Usage: spawn --user <username> [--mode login|robot|admin] [--node <nodename>]" >&2
+    exit 1
+fi
+
+CLUSTER_NAME="${CLUSTER_NAME:-cluster}"
+GATEWAY_DIR="${GATEWAY_DIR:-${LOGINBOX_DIR:-/etc/login-gateway}}"
+if [[ ! -d "$GATEWAY_DIR" && -d /etc/loginbox ]]; then
+    GATEWAY_DIR="/etc/loginbox"
+fi
+STATUS_ENABLED="${STATUS_ENABLED:-1}"
+AGENT_GUARDRAILS_ENABLED="${AGENT_GUARDRAILS_ENABLED:-1}"
+POD_HOSTNAME_TEMPLATE="${POD_HOSTNAME_TEMPLATE-%c-%m-%u}"
+
+if [[ "$MODE" == "robot" ]]; then
+    PARTITION="${LOGIN_PARTITION:-login}"
+    JOB_NAME="robot-${TARGET_USER}"
+    CPUS="${ROBOT_CPUS:-2}"
+    MEM="${ROBOT_MEM:-1G}"
+    WALLTIME="${ROBOT_WALLTIME:-1-00:00:00}"
+    UNIT_NAME="login-gateway-robot-${TARGET_USER}"
+    ROUTE_NAME="robot-${TARGET_USER}"
+elif [[ "$MODE" == "admin" ]]; then
+    PARTITION="${ADMIN_PARTITION:-${LOGIN_PARTITION:-login}}"
+    JOB_NAME="admin-${TARGET_USER}"
+    CPUS="${ADMIN_CPUS:-4}"
+    MEM="${ADMIN_MEM:-8G}"
+    WALLTIME="${ADMIN_WALLTIME:-7-00:00:00}"
+    UNIT_NAME="login-gateway-admin-${TARGET_USER}"
+    ROUTE_NAME="admin-${TARGET_USER}"
+else
+    MODE="login"
+    PARTITION="${LOGIN_PARTITION:-login}"
+    JOB_NAME="${JOB_NAME:-login-${TARGET_USER}}"
+    CPUS="${LOGIN_CPUS:-4}"
+    MEM="${LOGIN_MEM:-4G}"
+    WALLTIME="${LOGIN_WALLTIME:-7-00:00:00}"
+    UNIT_NAME="login-gateway-salloc-${TARGET_USER}"
+    ROUTE_NAME="${TARGET_USER}"
+fi
+
+# Format & sanitize RFC-1123 per-user pod hostname (<= 63 chars, [a-z0-9-])
+POD_HOSTNAME=""
+if [[ -n "$POD_HOSTNAME_TEMPLATE" ]]; then
+    raw_hn="$POD_HOSTNAME_TEMPLATE"
+    raw_hn="${raw_hn//%c/$CLUSTER_NAME}"
+    raw_hn="${raw_hn//%m/$MODE}"
+    raw_hn="${raw_hn//%u/$TARGET_USER}"
+    POD_HOSTNAME=$(printf '%s' "$raw_hn" | tr '[:upper:]_.' '[:lower:]--' | tr -cd 'a-z0-9-' | cut -c1-63)
+    POD_HOSTNAME="${POD_HOSTNAME#-}"
+    POD_HOSTNAME="${POD_HOSTNAME%-}"
+fi
+
+if [[ "$MODE" == "admin" ]]; then
+    IMAGE="${ADMIN_IMAGE_PATH:-}"
+    if [[ -z "$IMAGE" || ! -f "$IMAGE" ]]; then
+        for candidate_img in \
+            "/cache/slurm-login-pods-admin.sqsh" \
+            "/cache/slurm-enroot-login-admin.sqsh" \
+            "/cache/slurm-enroot-login-admin-v1.sqsh"; do
+            if [[ -f "$candidate_img" ]]; then
+                IMAGE="$candidate_img"
+                break
+            fi
+        done
+    fi
+    if [[ -z "$IMAGE" || ! -f "$IMAGE" ]]; then
+        echo "ERROR: Admin pod squashfs image not found (checked ADMIN_IMAGE_PATH=${ADMIN_IMAGE_PATH:-unset})." >&2
+        exit 1
+    fi
+else
+    IMAGE="${IMAGE_PATH:-}"
+    if [[ -z "$IMAGE" || ! -f "$IMAGE" ]]; then
+        for candidate_img in \
+            "/cache/slurm-login-pods.sqsh" \
+            "/cache/slurm-enroot-login-v2.sqsh" \
+            "/cache/slurm-enroot-login-sshd.sqsh" \
+            "/cache/slurm-enroot-login.sqsh"; do
+            if [[ -f "$candidate_img" ]]; then
+                IMAGE="$candidate_img"
+                break
+            fi
+        done
+    fi
+    if [[ -z "$IMAGE" || ! -f "$IMAGE" ]]; then
+        echo "ERROR: Login pod squashfs image not found (checked IMAGE_PATH=${IMAGE_PATH:-unset})." >&2
+        exit 1
+    fi
+fi
+
+STATE_BASE="/run/login-gateway"
+[[ ! -d /run/login-gateway && -d /run/loginbox ]] && STATE_BASE="/run/loginbox"
+ROUTE_DIR="${STATE_BASE}/routes"
+LOCK_DIR="${STATE_BASE}/locks"
+LOG_DIR="${STATE_BASE}/logs"
+mkdir -p "$ROUTE_DIR" "$LOCK_DIR" "$LOG_DIR" 2>/dev/null || true
+chmod 755 "$STATE_BASE" "$ROUTE_DIR" 2>/dev/null || true
+chmod 700 "$LOCK_DIR" 2>/dev/null || true
+chmod 711 "$LOG_DIR" 2>/dev/null || true
+
+ROUTE_FILE="${ROUTE_DIR}/${ROUTE_NAME}"
+LOCK_FILE="${LOCK_DIR}/${JOB_NAME}.lock"
+LOG_FILE="${LOG_DIR}/${JOB_NAME}.log"
+
+exec 9>"$LOCK_FILE"
+if ! flock -w "$(( WAIT_TIMEOUT + 10 ))" 9; then
+    echo "ERROR: Timed out waiting on spawn lock for ${JOB_NAME}." >&2
+    exit 1
+fi
+
+PW_LINE=$(getent -s sss passwd "$TARGET_USER" 2>/dev/null || getent passwd "$TARGET_USER" 2>/dev/null || true)
+USER_UID=""
+USER_GID=""
+USER_HOME=""
+USER_SHELL="/bin/bash"
+if [[ -n "$PW_LINE" ]]; then
+    IFS=":" read -r _pw_name _pw_x USER_UID USER_GID _pw_gecos USER_HOME USER_SHELL <<< "$PW_LINE"
+fi
+[[ -z "$USER_HOME" ]] && USER_HOME="/home/${TARGET_USER}"
+[[ -z "$USER_SHELL" || "$USER_SHELL" == *"/login-gateway/"* || "$USER_SHELL" == *"login-helper"* ]] && USER_SHELL="/bin/bash"
+if [[ "$MODE" == "admin" && ( -z "$USER_UID" || -z "$USER_GID" ) ]]; then
+    echo "ERROR: unable to resolve uid/gid for admin user ${TARGET_USER}." >&2
+    exit 1
+fi
+
+ls -d "${USER_HOME}/." >/dev/null 2>&1 || true
+ls -d /cvmfs/soft.computecanada.ca/. >/dev/null 2>&1 || true
+
+tcp_probe() {
+    local host="$1" port="$2"
+    python3 -c "import socket, sys; s=socket.socket(); s.settimeout(0.15); s.connect((sys.argv[1], int(sys.argv[2]))); s.close()" "$host" "$port" >/dev/null 2>&1
+}
+
+query_login_job() {
+    local owner="$TARGET_USER"
+    [[ "$MODE" == "admin" ]] && owner="root"
+    squeue -h -u "$owner" -p "$PARTITION" -n "$JOB_NAME" -t R,PD -o "%i|%t|%N|%k" 2>/dev/null | head -n 1
+}
+
+try_reuse_running_job() {
+    local info="$1"
+    local jid jstate _jnode jcomment cnode cport cfp
+    IFS="|" read -r jid jstate _jnode jcomment <<< "$info"
+    if [[ "$jstate" == "R" && "$jcomment" == *:*:* ]]; then
+        IFS=":" read -r cnode cport cfp <<< "$jcomment"
+        if [[ -z "$TARGET_NODE" || "$cnode" == "$TARGET_NODE" ]]; then
+            if tcp_probe "$cnode" "$cport"; then
+                echo "${jid}|${cnode}|${cport}|${cfp}" > "$ROUTE_FILE" 2>/dev/null || true
+                chmod 644 "$ROUTE_FILE" 2>/dev/null || true
+                echo "${jid}|${cnode}|${cport}|${cfp}"
+                return 0
+            fi
+        fi
+    fi
+    return 1
+}
+
+# 1. Reuse running job or wait briefly if peer gateway is starting one
+existing=$(query_login_job)
+if [[ -n "$existing" ]]; then
+    if try_reuse_running_job "$existing"; then
+        exit 0
+    fi
+    IFS="|" read -r existing_jid existing_state existing_node existing_comment <<< "$existing"
+    if [[ -z "$TARGET_NODE" || -z "$existing_node" || "$existing_node" == "$TARGET_NODE" ]]; then
+        if [[ "$existing_state" == "PD" || ( "$existing_state" == "R" && -z "$existing_comment" ) ]]; then
+            for _ in $(seq 1 40); do
+                sleep 0.2
+                existing=$(query_login_job)
+                [[ -z "$existing" ]] && break
+                if try_reuse_running_job "$existing"; then
+                    exit 0
+                fi
+            done
+        fi
+    fi
+    existing=$(query_login_job)
+    if [[ -n "$existing" ]]; then
+        IFS="|" read -r stale_jid _ <<< "$existing"
+        if [[ -n "$stale_jid" ]]; then
+            scancel "$stale_jid" 2>/dev/null || su -s /bin/bash "$TARGET_USER" -c "scancel $stale_jid" 2>/dev/null || true
+            for _ in $(seq 1 30); do
+                [[ -z $(squeue -h -j "$stale_jid" 2>/dev/null) ]] && break
+                sleep 0.1
+            done
+        fi
+    fi
+fi
+
+for _ in $(seq 1 25); do
+    owner="$TARGET_USER"
+    [[ "$MODE" == "admin" ]] && owner="root"
+    [[ -z $(squeue -h -u "$owner" -p "$PARTITION" -n "$JOB_NAME" -t CG -o "%i" 2>/dev/null) ]] && break
+    sleep 0.2
+done
+
+# 2. Check partition capacity upfront for clear operator/user diagnostics
+PART_SUMMARY=$(sinfo -h -p "$PARTITION" -o "%a|%D|%T" 2>/dev/null | head -n 1 || true)
+if [[ -z "$PART_SUMMARY" ]]; then
+    echo "ERROR: Slurm partition '${PARTITION}' is unavailable or slurmctld is unreachable." >&2
+    exit 1
+fi
+
+# 3. Build container bind mounts
+build_mounts() {
+    local m
+    if [[ "$MODE" == "admin" ]]; then
+        m="/etc/slurm,/run/munge,/cache,/cvmfs,/home"
+        [[ -d /scratch ]] && m+=",/scratch"
+        [[ -d /projects ]] && m+=",/projects"
+        [[ -d /project ]] && m+=",/project"
+        m+=",${GATEWAY_DIR}:/etc/login-gateway:ro,${GATEWAY_DIR}:/etc/loginbox:ro"
+        [[ -d /etc/cluster-status ]] && m+=",/etc/cluster-status:/etc/cluster-status:ro"
+        [[ -d /etc/claude-code && "$AGENT_GUARDRAILS_ENABLED" == "1" ]] && m+=",/etc/claude-code:/etc/claude-code:ro"
+        [[ -f /etc/agents/site.md && "$AGENT_GUARDRAILS_ENABLED" == "1" ]] && m+=",/etc/agents/site.md:/etc/agents/site.md:ro"
+        [[ -d /var/lib/sss/pipes ]] && m+=",/var/lib/sss/pipes"
+        [[ -d /var/lib/sss/mc ]] && m+=",/var/lib/sss/mc:/var/lib/sss/mc:ro"
+        echo "$m"
+        return
+    fi
+
+    m="/etc/slurm,/run/munge,/cache,/cvmfs,${USER_HOME},${GATEWAY_DIR}:/etc/login-gateway:ro,${GATEWAY_DIR}:/etc/loginbox:ro"
+    [[ -d "/scratch/${TARGET_USER}" ]] && m+=",/scratch/${TARGET_USER}"
+    [[ -d "/projects/${TARGET_USER}" ]] && m+=",/projects/${TARGET_USER}"
+    local g
+    for g in $(id -Gn "$TARGET_USER" 2>/dev/null); do
+        if [[ "$g" != "$TARGET_USER" ]]; then
+            [[ -d "/projects/$g" ]] && m+=",/projects/$g"
+            [[ -d "/project/$g" ]] && m+=",/project/$g"
+        fi
+    done
+    if [[ "$MODE" != "robot" ]]; then
+        [[ -d /etc/cluster-status ]] && m+=",/etc/cluster-status:/etc/cluster-status:ro"
+        [[ -d /etc/claude-code && "$AGENT_GUARDRAILS_ENABLED" == "1" ]] && m+=",/etc/claude-code:/etc/claude-code:ro"
+        [[ -f /etc/agents/site.md && "$AGENT_GUARDRAILS_ENABLED" == "1" ]] && m+=",/etc/agents/site.md:/etc/agents/site.md:ro"
+    fi
+    echo "$m"
+}
+
+MOUNTS=$(build_mounts)
+NODE_ARG=""
+[[ -n "$TARGET_NODE" ]] && NODE_ARG="-w ${TARGET_NODE}"
+
+UNSHARE_ARG=""
+if [[ -n "$POD_HOSTNAME" ]] && /usr/bin/srun --help 2>&1 | grep -q -- '--container-unshare'; then
+    UNSHARE_ARG="--container-unshare=uts"
+fi
+
+if [[ "$MODE" == "admin" ]]; then
+    ENTRYPOINT_CMD="/usr/local/bin/admin-container-sshd-entrypoint"
+    for ep in "${GATEWAY_DIR}/admin-container-sshd-entrypoint.sh" "/etc/loginbox/admin-container-sshd-entrypoint.sh"; do
+        if [[ -x "$ep" ]]; then
+            ENTRYPOINT_CMD="/etc/login-gateway/admin-container-sshd-entrypoint.sh"
+            break
+        fi
+    done
+else
+    ENTRYPOINT_CMD="/usr/local/bin/container-sshd-entrypoint"
+    for ep in "${GATEWAY_DIR}/container-sshd-entrypoint.sh" "/etc/loginbox/container-sshd-entrypoint.sh"; do
+        if [[ -x "$ep" ]]; then
+            ENTRYPOINT_CMD="/etc/login-gateway/container-sshd-entrypoint.sh"
+            break
+        fi
+    done
+fi
+
+rm -f "$LOG_FILE" 2>/dev/null || true
+touch "$LOG_FILE"
+chmod 600 "$LOG_FILE"
+[[ "$MODE" != "admin" ]] && chown "$TARGET_USER" "$LOG_FILE" 2>/dev/null || true
+
+if [[ "$MODE" == "admin" && "$(id -u)" -ne 0 ]]; then
+    echo "ERROR: admin root pod must be spawned by root (Slurm job UID 0 + ENROOT_ALLOW_SUPERUSER)." >&2
+    exit 1
+fi
+
+COMMON_ENV_NAMES="LOGIN_GATEWAY_SESSION_MODE,LOGINBOX_SESSION_MODE,LOGIN_GATEWAY_POD_HOSTNAME,LOGIN_GATEWAY_CLUSTER_NAME,LOGIN_GATEWAY_STATUS_ENABLED,LOGIN_GATEWAY_GUARDRAILS_ENABLED"
+
+if [[ "$(id -u)" -eq 0 && "$MODE" == "admin" ]]; then
+    SRUN_ADMIN_FLAGS="--container-writable --no-container-mount-home ${UNSHARE_ARG} --container-env=ENROOT_ALLOW_SUPERUSER,${COMMON_ENV_NAMES},LOGINBOX_ADMIN_USER,LOGINBOX_ADMIN_UID,LOGINBOX_ADMIN_GID,LOGINBOX_ADMIN_HOME,LOGINBOX_ADMIN_SHELL"
+    systemctl stop "${UNIT_NAME}.service" 2>/dev/null || true
+    systemctl reset-failed "${UNIT_NAME}.service" 2>/dev/null || true
+    systemd-run --quiet \
+        --unit="$UNIT_NAME" \
+        --slice=system.slice \
+        --working-directory=/tmp \
+        --setenv="HOME=/root" \
+        --setenv="USER=root" \
+        --setenv="LOGNAME=root" \
+        --setenv="ENROOT_ALLOW_SUPERUSER=yes" \
+        --setenv="LOGIN_GATEWAY_SESSION_MODE=admin" \
+        --setenv="LOGINBOX_SESSION_MODE=admin" \
+        --setenv="LOGIN_GATEWAY_POD_HOSTNAME=${POD_HOSTNAME}" \
+        --setenv="LOGIN_GATEWAY_CLUSTER_NAME=${CLUSTER_NAME}" \
+        --setenv="LOGIN_GATEWAY_STATUS_ENABLED=${STATUS_ENABLED}" \
+        --setenv="LOGIN_GATEWAY_GUARDRAILS_ENABLED=${AGENT_GUARDRAILS_ENABLED}" \
+        --setenv="LOGINBOX_ADMIN_USER=${TARGET_USER}" \
+        --setenv="LOGINBOX_ADMIN_UID=${USER_UID}" \
+        --setenv="LOGINBOX_ADMIN_GID=${USER_GID}" \
+        --setenv="LOGINBOX_ADMIN_HOME=${USER_HOME}" \
+        --setenv="LOGINBOX_ADMIN_SHELL=${USER_SHELL}" \
+        --property="KillMode=control-group" \
+        /bin/bash -c "export ENROOT_ALLOW_SUPERUSER=yes LOGIN_GATEWAY_SESSION_MODE=admin LOGINBOX_SESSION_MODE=admin LOGIN_GATEWAY_POD_HOSTNAME=${POD_HOSTNAME@Q} LOGIN_GATEWAY_CLUSTER_NAME=${CLUSTER_NAME@Q} LOGIN_GATEWAY_STATUS_ENABLED=${STATUS_ENABLED@Q} LOGIN_GATEWAY_GUARDRAILS_ENABLED=${AGENT_GUARDRAILS_ENABLED@Q} LOGINBOX_ADMIN_USER=${TARGET_USER} LOGINBOX_ADMIN_UID=${USER_UID} LOGINBOX_ADMIN_GID=${USER_GID} LOGINBOX_ADMIN_HOME=${USER_HOME@Q} LOGINBOX_ADMIN_SHELL=${USER_SHELL@Q}; exec /usr/bin/salloc -p ${PARTITION} -J ${JOB_NAME} --cpus-per-task=${CPUS} --mem=${MEM} -t ${WALLTIME} ${NODE_ARG} /usr/bin/srun --overlap --export=ALL --container-image=${IMAGE} --container-mounts=${MOUNTS} ${SRUN_ADMIN_FLAGS} ${ENTRYPOINT_CMD} </dev/null >>${LOG_FILE} 2>&1"
+elif [[ "$(id -u)" -eq 0 ]]; then
+    SRUN_USER_FLAGS="${UNSHARE_ARG} --container-env=${COMMON_ENV_NAMES}"
+    systemctl stop "${UNIT_NAME}.service" 2>/dev/null || true
+    systemctl reset-failed "${UNIT_NAME}.service" 2>/dev/null || true
+    systemd-run --quiet \
+        --unit="$UNIT_NAME" \
+        --slice=system.slice \
+        --uid="$TARGET_USER" \
+        --gid="$TARGET_USER" \
+        --working-directory=/tmp \
+        --setenv="HOME=${USER_HOME}" \
+        --setenv="USER=${TARGET_USER}" \
+        --setenv="LOGNAME=${TARGET_USER}" \
+        --setenv="LOGIN_GATEWAY_SESSION_MODE=${MODE}" \
+        --setenv="LOGINBOX_SESSION_MODE=${MODE}" \
+        --setenv="LOGIN_GATEWAY_POD_HOSTNAME=${POD_HOSTNAME}" \
+        --setenv="LOGIN_GATEWAY_CLUSTER_NAME=${CLUSTER_NAME}" \
+        --setenv="LOGIN_GATEWAY_STATUS_ENABLED=${STATUS_ENABLED}" \
+        --setenv="LOGIN_GATEWAY_GUARDRAILS_ENABLED=${AGENT_GUARDRAILS_ENABLED}" \
+        --property="KillMode=control-group" \
+        /bin/bash -c "export LOGIN_GATEWAY_SESSION_MODE=${MODE@Q} LOGINBOX_SESSION_MODE=${MODE@Q} LOGIN_GATEWAY_POD_HOSTNAME=${POD_HOSTNAME@Q} LOGIN_GATEWAY_CLUSTER_NAME=${CLUSTER_NAME@Q} LOGIN_GATEWAY_STATUS_ENABLED=${STATUS_ENABLED@Q} LOGIN_GATEWAY_GUARDRAILS_ENABLED=${AGENT_GUARDRAILS_ENABLED@Q}; exec /usr/bin/salloc -p ${PARTITION} -J ${JOB_NAME} --cpus-per-task=${CPUS} --mem=${MEM} -t ${WALLTIME} ${NODE_ARG} /usr/bin/srun --overlap --export=ALL --container-image=${IMAGE} --container-mounts=${MOUNTS} ${SRUN_USER_FLAGS} ${ENTRYPOINT_CMD} </dev/null >>${LOG_FILE} 2>&1"
+else
+    cd /tmp
+    LOGIN_GATEWAY_SESSION_MODE="${MODE}" LOGINBOX_SESSION_MODE="${MODE}" \
+        LOGIN_GATEWAY_POD_HOSTNAME="${POD_HOSTNAME}" LOGIN_GATEWAY_CLUSTER_NAME="${CLUSTER_NAME}" \
+        LOGIN_GATEWAY_STATUS_ENABLED="${STATUS_ENABLED}" LOGIN_GATEWAY_GUARDRAILS_ENABLED="${AGENT_GUARDRAILS_ENABLED}" \
+        nohup setsid /usr/bin/salloc -p "$PARTITION" -J "$JOB_NAME" --cpus-per-task="$CPUS" --mem="$MEM" -t "$WALLTIME" $NODE_ARG \
+        /usr/bin/srun --overlap --export=ALL --container-image="$IMAGE" --container-mounts="$MOUNTS" $UNSHARE_ARG \
+        "$ENTRYPOINT_CMD" </dev/null >>"$LOG_FILE" 2>&1 &
+fi
+
+# 4. Poll until Slurm job Comment is populated (<node>:<port>:<fp>,<pubkey>) and TCP port is open
+deadline=$(( $(date +%s) + WAIT_TIMEOUT ))
+LAST_JID=""
+NOTIFIED_PENDING=0
+while (( $(date +%s) < deadline )); do
+    info=$(query_login_job)
+    if [[ -n "$info" ]]; then
+        IFS="|" read -r LAST_JID jstate _ <<< "$info"
+        if try_reuse_running_job "$info"; then
+            exit 0
+        fi
+        if [[ "$jstate" == "PD" && "$NOTIFIED_PENDING" -eq 0 && "$MODE" != "robot" ]]; then
+            reason=$(squeue -h -j "$LAST_JID" -o "%r" 2>/dev/null | head -n 1 || true)
+            if [[ -n "$reason" && "$reason" != "None" && "$reason" != "Priority" ]]; then
+                echo "Waiting for login pod capacity in partition '${PARTITION}' (Slurm reason: ${reason})..." >&2
+                NOTIFIED_PENDING=1
+            fi
+        fi
+    fi
+    sleep 0.1
+done
+
+PENDING_REASON=""
+if [[ -n "$LAST_JID" ]]; then
+    PENDING_REASON=$(squeue -h -j "$LAST_JID" -o "%r" 2>/dev/null | head -n 1 || true)
+    scancel "$LAST_JID" 2>/dev/null || su -s /bin/bash "$TARGET_USER" -c "scancel $LAST_JID" 2>/dev/null || true
+fi
+if [[ "$(id -u)" -eq 0 ]]; then
+    systemctl stop "${UNIT_NAME}.service" 2>/dev/null || true
+    systemctl reset-failed "${UNIT_NAME}.service" 2>/dev/null || true
+fi
+
+if [[ "$PENDING_REASON" == "Resources" || "$PENDING_REASON" == "ReqNodeNotAvail"* ]]; then
+    echo "ERROR: No capacity currently available in Slurm partition '${PARTITION}' to start ${JOB_NAME} (${PENDING_REASON})." >&2
+else
+    echo "ERROR: Timed out waiting for ${JOB_NAME} pod sshd to become ready${PENDING_REASON:+ (Slurm reason: ${PENDING_REASON})}." >&2
+fi
+[[ -f "$LOG_FILE" ]] && tail -n 20 "$LOG_FILE" >&2
+exit 1

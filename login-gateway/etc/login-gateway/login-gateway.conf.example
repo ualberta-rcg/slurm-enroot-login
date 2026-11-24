@@ -1,0 +1,90 @@
+# /etc/login-gateway/login-gateway.conf
+# Site configuration for slurm-login-pods login-gateway & robot-gateway nodes.
+# Copy to /etc/login-gateway/login-gateway.conf on each gateway node.
+# Never commit cluster secrets, private keys, or PII into version control.
+
+# Short cluster identifier (used for pod hostnames, CC_CLUSTER, and status banner)
+CLUSTER_NAME="cluster"
+
+# Gateway state & runtime configuration directory
+GATEWAY_DIR="/etc/login-gateway"
+
+# Slurm partition and squashfs image path for user & robot pods
+# (Use a versioned filename on shared storage to avoid NFS ESTALE during updates)
+LOGIN_PARTITION="login"
+IMAGE_PATH="/cache/slurm-login-pods.sqsh"
+
+# Interactive user pod sizing (login-<username>)
+LOGIN_CPUS="4"
+LOGIN_MEM="4G"
+LOGIN_WALLTIME="7-00:00:00"
+
+# Seconds to wait for a cold Slurm pod allocation to become ready
+WAIT_TIMEOUT="60"
+
+# Per-user UTS hostname inside pods (%c = CLUSTER_NAME, %m = login|robot|admin, %u = username).
+# Set to "" to keep the execution node's hostname inside the pod.
+POD_HOSTNAME_TEMPLATE="%c-%m-%u"
+
+# Direct gateway file transfer fast-path (scp / sftp / rsync / rrsync + CVMFS transfer wrappers).
+# When 1, validated transfers execute on the gateway inside XFER_SLICE with zero Slurm jobs.
+TRANSFER_FASTPATH="1"
+XFER_SLICE="login-gateway-xfer.slice"
+XFER_MEM_HIGH="256M"
+XFER_MEM_MAX="512M"
+XFER_CPU_QUOTA="100%"
+XFER_TASKS_MAX="32"
+
+# Alliance MFA automation ("robot") support:
+#   ROBOT_MODE="dedicated" — Alliance standard: dedicated robot.<cluster> host/IP
+#                            using AuthorizedKeysFile /dev/null + CCDB/LDAP keys.
+#   ROBOT_MODE="port22"    — Shared Port-22 multiplexing alongside MFA logins.
+ROBOT_ENABLED="1"
+ROBOT_MODE="dedicated"
+ROBOT_GROUP="mfa-automation-users"
+ROBOT_CPUS="2"
+ROBOT_MEM="1G"
+ROBOT_WALLTIME="1-00:00:00"
+
+# Strictly follow Alliance policy: robot SSH keys must come from SSSD/LDAP (CCDB),
+# never from ~/.ssh/authorized_keys. Set to 1 only on standalone non-LDAP testbeds.
+ALLOW_HOME_ROBOT_KEYS="0"
+
+# Space-separated LDAP/POSIX groups for cluster staff / gateway operators.
+GATEWAY_BYPASS_GROUPS="gateway-admins ccstaff"
+
+# Optional privileged admin root pod (admin-<username>).
+# When 1, interactive sessions for GATEWAY_BYPASS_GROUPS spawn a UID-0 Slurm pod
+# (ENROOT_ALLOW_SUPERUSER=yes, no userns, top-level /home + SSSD sockets mounted)
+# instead of landing on the gateway host. Falls back to gateway host on failure.
+# Prerequisite: ADMIN_PARTITION must have DisableRootJobs=NO.
+ADMIN_POD_ENABLED="0"
+ADMIN_PARTITION="login"
+ADMIN_IMAGE_PATH="/cache/slurm-login-pods-admin.sqsh"
+ADMIN_CPUS="4"
+ADMIN_MEM="8G"
+ADMIN_WALLTIME="7-00:00:00"
+
+# Behaviour when slurmctld is unreachable and no running login pod exists:
+#   "restricted-shell" — drop interactive users into a tightly capped cgroup shell
+#                        on the gateway so files remain accessible during outages.
+#   "deny"             — refuse interactive login with a clear outage message.
+SLURM_DOWN_FALLBACK="restricted-shell"
+FALLBACK_MEM_MAX="512M"
+FALLBACK_CPU_QUOTA="50%"
+FALLBACK_TASKS_MAX="32"
+
+# Toggle login status banner (cluster-status) and AI coding agent guardrails
+STATUS_ENABLED="1"
+AGENT_GUARDRAILS_ENABLED="1"
+
+# Minimum UID treated as a normal cluster user (system accounts below this are ignored)
+MIN_CLUSTER_UID="10000"
+
+# Comma-separated internal cluster CIDRs (Open OnDemand Shell app, compute/peer nodes)
+INTERNAL_CIDRS="10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,127.0.0.0/8"
+
+# Optional space-separated list of synthetic NSS shim accounts allowed to resolve
+# the real username via /etc/login-gateway/hooks/identity. Leave empty on standard
+# SSSD/LDAP Alliance clusters.
+SHIM_USERS=""

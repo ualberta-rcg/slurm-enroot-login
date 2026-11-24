@@ -1,0 +1,183 @@
+#!/bin/bash
+# /usr/local/libexec/login-gateway/classify-transfer
+# Validates whether an incoming SSH command is a pure server-side file transfer
+# (sftp-server, scp -t/-f, rsync --server, rrsync, or an Alliance CVMFS
+# allowed_commands wrapper invoked with a transfer SSH_ORIGINAL_COMMAND).
+#
+# Sets:
+#   NORMALIZED_XFER_CMD      — validated command string to execute on the gateway
+#   NORMALIZED_XFER_ORIG_CMD — normalized SSH_ORIGINAL_COMMAND (when applicable)
+#
+# Rejects any shell metacharacter smuggling (; | & ` $() ${} > < \n \r).
+
+resolve_sftp_server_bin() {
+    if [[ -x /usr/libexec/openssh/sftp-server ]]; then
+        echo "/usr/libexec/openssh/sftp-server"
+    elif [[ -x /usr/lib/openssh/sftp-server ]]; then
+        echo "/usr/lib/openssh/sftp-server"
+    else
+        echo "/usr/lib/openssh/sftp-server"
+    fi
+}
+
+has_shell_metachars() {
+    local s="${1:-}"
+    if [[ "$s" == *$'\n'* || "$s" == *$'\r'* ]]; then
+        return 0
+    fi
+    if [[ "$s" == *";"* || "$s" == *"|"* || "$s" == *"&"* || "$s" == *'`'* || "$s" == *'$('* || "$s" == *'${'* || "$s" == *">"* || "$s" == *"<"* ]]; then
+        return 0
+    fi
+    return 1
+}
+
+classify_direct_transfer_cmd() {
+    local cmd="${1:-}"
+    NORMALIZED_XFER_CMD=""
+
+    [[ -z "$cmd" ]] && return 1
+    has_shell_metachars "$cmd" && return 1
+
+    cmd="${cmd#"${cmd%%[![:space:]]*}"}"
+    [[ -z "$cmd" ]] && return 1
+
+    local first_tok rest=""
+    if [[ "$cmd" == *[[:space:]]* ]]; then
+        first_tok="${cmd%%[[:space:]]*}"
+        rest="${cmd#*[[:space:]]}"
+        rest="${rest#"${rest%%[![:space:]]*}"}"
+    else
+        first_tok="$cmd"
+    fi
+
+    local sftp_bin
+    sftp_bin="$(resolve_sftp_server_bin)"
+
+    case "$first_tok" in
+        sftp-server|/usr/lib/openssh/sftp-server|/usr/libexec/openssh/sftp-server|internal-sftp)
+            if [[ -n "$rest" ]]; then
+                NORMALIZED_XFER_CMD="${sftp_bin} ${rest}"
+            else
+                NORMALIZED_XFER_CMD="${sftp_bin}"
+            fi
+            return 0
+            ;;
+        scp|/usr/bin/scp)
+            [[ -z "$rest" ]] && return 1
+            local tok has_tf=0
+            for tok in $rest; do
+                [[ "$tok" == "--" ]] && break
+                [[ "$tok" != -* ]] && break
+                if [[ "$tok" =~ ^-[rpdqvfCtO]*[tf][rpdqvfCtO]*$ ]]; then
+                    has_tf=1
+                    break
+                fi
+            done
+            [[ "$has_tf" -ne 1 ]] && return 1
+            NORMALIZED_XFER_CMD="/usr/bin/scp ${rest}"
+            return 0
+            ;;
+        rsync|/usr/bin/rsync)
+            [[ -z "$rest" ]] && return 1
+            local first_arg="${rest%%[[:space:]]*}"
+            [[ "$first_arg" != "--server" ]] && return 1
+            if [[ " $rest " == *" --daemon"* || " $rest " == *" --config"* ]]; then
+                return 1
+            fi
+            NORMALIZED_XFER_CMD="/usr/bin/rsync ${rest}"
+            return 0
+            ;;
+    esac
+
+    return 1
+}
+
+classify_transfer_cmd() {
+    local cmd="${1:-}"
+    local orig_cmd="${2:-}"
+    NORMALIZED_XFER_CMD=""
+    NORMALIZED_XFER_ORIG_CMD="${orig_cmd}"
+
+    [[ -z "$cmd" ]] && return 1
+    has_shell_metachars "$cmd" && return 1
+
+    cmd="${cmd#"${cmd%%[![:space:]]*}"}"
+    cmd="${cmd%"${cmd##*[![:space:]]}"}"
+    [[ -z "$cmd" ]] && return 1
+
+    # 1. Direct server-side transfer commands (scp -t/-f, sftp-server, rsync --server)
+    if classify_direct_transfer_cmd "$cmd"; then
+        return 0
+    fi
+
+    local first_tok rest=""
+    if [[ "$cmd" == *[[:space:]]* ]]; then
+        first_tok="${cmd%%[[:space:]]*}"
+        rest="${cmd#*[[:space:]]}"
+        rest="${rest#"${rest%%[![:space:]]*}"}"
+    else
+        first_tok="$cmd"
+    fi
+
+    # 2. rrsync forced-command wrapper with validated rsync --server SSH_ORIGINAL_COMMAND
+    case "$first_tok" in
+        rrsync|/usr/bin/rrsync|/usr/local/bin/rrsync)
+            [[ -z "$orig_cmd" ]] && return 1
+            has_shell_metachars "$orig_cmd" && return 1
+            local orig_trimmed="${orig_cmd#"${orig_cmd%%[![:space:]]*}"}"
+            if [[ "$orig_trimmed" != "rsync --server"* && "$orig_trimmed" != "/usr/bin/rsync --server"* ]]; then
+                return 1
+            fi
+            local rrsync_bin="/usr/bin/rrsync"
+            [[ -x /usr/local/bin/rrsync && ! -x /usr/bin/rrsync ]] && rrsync_bin="/usr/local/bin/rrsync"
+            if [[ -n "$rest" ]]; then
+                NORMALIZED_XFER_CMD="${rrsync_bin} ${rest}"
+            else
+                NORMALIZED_XFER_CMD="${rrsync_bin}"
+            fi
+            return 0
+            ;;
+        # 3. Alliance CVMFS allowed_commands wrappers when SSH_ORIGINAL_COMMAND is a transfer.
+        #    Non-transfer commands under allowed_commands.sh (e.g. sbatch) return 1 so they
+        #    route into the robot-<user> Slurm pod rather than executing on the gateway.
+        /cvmfs/soft.computecanada.ca/custom/bin/computecanada/allowed_commands/transfer_commands.sh|\
+        /cvmfs/soft.computecanada.ca/custom/bin/computecanada/allowed_commands/allowed_commands.sh)
+            [[ -n "$rest" ]] && return 1
+            [[ -z "$orig_cmd" ]] && return 1
+            local saved_wrapper="$first_tok"
+            if ! classify_direct_transfer_cmd "$orig_cmd"; then
+                NORMALIZED_XFER_CMD=""
+                return 1
+            fi
+            # Alliance allowed_commands.sh matches /usr/libexec/openssh/sftp-server* on RHEL;
+            # rewrite /usr/lib/openssh/sftp-server or bare sftp-server/internal-sftp so the
+            # CVMFS wrapper accepts SFTP and modern OpenSSH 9+ scp on Ubuntu/Debian too.
+            local orig_trimmed="${orig_cmd#"${orig_cmd%%[![:space:]]*}"}"
+            case "$orig_trimmed" in
+                /usr/lib/openssh/sftp-server*)
+                    NORMALIZED_XFER_ORIG_CMD="/usr/libexec/openssh/sftp-server${orig_trimmed#/usr/lib/openssh/sftp-server}"
+                    ;;
+                sftp-server*)
+                    NORMALIZED_XFER_ORIG_CMD="/usr/libexec/openssh/sftp-server${orig_trimmed#sftp-server}"
+                    ;;
+                internal-sftp*)
+                    NORMALIZED_XFER_ORIG_CMD="/usr/libexec/openssh/sftp-server${orig_trimmed#internal-sftp}"
+                    ;;
+            esac
+            if [[ -x "$saved_wrapper" ]]; then
+                NORMALIZED_XFER_CMD="$saved_wrapper"
+            fi
+            return 0
+            ;;
+    esac
+
+    return 1
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    if classify_transfer_cmd "${1:-}" "${2:-}"; then
+        echo "$NORMALIZED_XFER_CMD"
+        exit 0
+    fi
+    exit 1
+fi

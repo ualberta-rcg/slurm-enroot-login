@@ -1,0 +1,678 @@
+#!/bin/bash
+# /usr/local/libexec/login-gateway/route
+# Privileged session router for slurm-login-pods login-gateway & robot-gateway.
+#
+# Identity resolution (security-critical):
+#   - Standard Alliance clusters (SHIM_USERS=""): trusts SUDO_USER exclusively.
+#     CLI user arguments are ignored unless invoked directly by root (e.g.
+#     `enter-login-job` run by root).
+#   - Sites with synthetic NSS shim accounts (SUDO_USER in SHIM_USERS): invokes
+#     root-owned /etc/login-gateway/hooks/identity (or legacy CLI fallback when
+#     invoked via legacy switch-user.sh during cutover).
+#
+# Routing precedence:
+#   1. Robot session detection & ROBOT_GROUP (`mfa-automation-users`) verification.
+#   2. Direct gateway file-transfer fast-path (`scp`, `sftp-server`, `rsync --server`,
+#      `rrsync`, and Alliance CVMFS `transfer_commands.sh` / `allowed_commands.sh`
+#      when SSH_ORIGINAL_COMMAND is a transfer) inside `login-gateway-xfer.slice`
+#      (0 Slurm jobs).
+#   3. Maintenance check (`/etc/nologin` or `/run/nologin` for non-bypass users).
+#   4. Admin root pod (`admin-<user>`) when `ADMIN_POD_ENABLED=1` and user is in
+#      `GATEWAY_BYPASS_GROUPS`, with automatic fallback to gateway host shell.
+#   5. Gateway host shell for `GATEWAY_BYPASS_GROUPS` when `ADMIN_POD_ENABLED=0`
+#      or `host` / `--force-host` is requested.
+#   6. Persistent Slurm pod routing (`login-<user>` or `robot-<user>`) over internal
+#      SSH with pinned Ed25519 container host key, falling back to a capped gateway
+#      rescue shell during slurmctld outages when `SLURM_DOWN_FALLBACK=restricted-shell`.
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+for candidate_conf in \
+    "${LOGIN_GATEWAY_CONF:-}" \
+    "/etc/login-gateway/login-gateway.conf" \
+    "/etc/loginbox/loginbox.conf"; do
+    if [[ -n "$candidate_conf" && -r "$candidate_conf" ]]; then
+        # shellcheck disable=SC1090
+        source "$candidate_conf"
+        break
+    fi
+done
+
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/classify-transfer"
+
+# Pure classifier mode for automated unit tests
+if [[ "${1:-}" == "--classify-transfer" ]]; then
+    if classify_transfer_cmd "${2:-}" "${3:-}"; then
+        echo "$NORMALIZED_XFER_CMD"
+        exit 0
+    fi
+    exit 1
+fi
+
+GATEWAY_DIR="${GATEWAY_DIR:-${LOGINBOX_DIR:-/etc/login-gateway}}"
+if [[ ! -d "$GATEWAY_DIR" && -d /etc/loginbox ]]; then
+    GATEWAY_DIR="/etc/loginbox"
+fi
+
+LOGIN_PARTITION="${LOGIN_PARTITION:-login}"
+ADMIN_PARTITION="${ADMIN_PARTITION:-$LOGIN_PARTITION}"
+ADMIN_POD_ENABLED="${ADMIN_POD_ENABLED:-0}"
+GATEWAY_BYPASS_GROUPS="${GATEWAY_BYPASS_GROUPS:-gateway-admins ccstaff}"
+ROBOT_ENABLED="${ROBOT_ENABLED:-1}"
+ROBOT_MODE="${ROBOT_MODE:-dedicated}"
+ROBOT_GROUP="${ROBOT_GROUP:-mfa-automation-users}"
+TRANSFER_FASTPATH="${TRANSFER_FASTPATH:-1}"
+XFER_SLICE="${XFER_SLICE:-login-gateway-xfer.slice}"
+XFER_MEM_HIGH="${XFER_MEM_HIGH:-256M}"
+XFER_MEM_MAX="${XFER_MEM_MAX:-512M}"
+XFER_CPU_QUOTA="${XFER_CPU_QUOTA:-100%}"
+XFER_TASKS_MAX="${XFER_TASKS_MAX:-32}"
+SLURM_DOWN_FALLBACK="${SLURM_DOWN_FALLBACK:-restricted-shell}"
+FALLBACK_MEM_MAX="${FALLBACK_MEM_MAX:-512M}"
+FALLBACK_CPU_QUOTA="${FALLBACK_CPU_QUOTA:-50%}"
+FALLBACK_TASKS_MAX="${FALLBACK_TASKS_MAX:-32}"
+STATUS_ENABLED="${STATUS_ENABLED:-1}"
+INTERNAL_CIDRS="${INTERNAL_CIDRS:-10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,127.0.0.0/8}"
+MIN_CLUSTER_UID="${MIN_CLUSTER_UID:-10000}"
+SHIM_USERS="${SHIM_USERS:-}"
+
+# Normalize session env vars (accept both LOGIN_GATEWAY_* and legacy LOGINBOX_*)
+ORIG_DISPLAY="${LOGIN_GATEWAY_ORIG_DISPLAY:-${LOGINBOX_ORIG_DISPLAY:-}}"
+ORIG_X11_COOKIE="${LOGIN_GATEWAY_ORIG_X11_COOKIE:-${LOGINBOX_ORIG_X11_COOKIE:-}}"
+ORIG_AUTH_SOCK="${LOGIN_GATEWAY_ORIG_AUTH_SOCK:-${LOGINBOX_ORIG_AUTH_SOCK:-}}"
+ORIG_TERM="${LOGIN_GATEWAY_ORIG_TERM:-${LOGINBOX_ORIG_TERM:-${TERM:-xterm-256color}}}"
+ORIG_SSH_CONNECTION="${LOGIN_GATEWAY_ORIG_SSH_CONNECTION:-${LOGINBOX_ORIG_SSH_CONNECTION:-}}"
+ORIG_SSH_ORIGINAL_COMMAND="${LOGIN_GATEWAY_ORIG_SSH_ORIGINAL_COMMAND:-${LOGINBOX_ORIG_SSH_ORIGINAL_COMMAND:-}}"
+ORIG_AUTH_TYPE="${LOGIN_GATEWAY_ORIG_AUTH_TYPE:-${LOGINBOX_ORIG_AUTH_TYPE:-}}"
+
+CLI_FORCE_CONTAINER="0"
+CLI_FORCE_ROBOT="0"
+CLI_FORCE_ADMIN="0"
+CLI_FORCE_HOST="0"
+while [[ "${1:-}" == --force-* || "${1:-}" == "--robot" ]]; do
+    case "$1" in
+        --force-container) CLI_FORCE_CONTAINER="1"; shift ;;
+        --force-robot|--robot) CLI_FORCE_ROBOT="1"; shift ;;
+        --force-admin)     CLI_FORCE_ADMIN="1"; shift ;;
+        --force-host)      CLI_FORCE_HOST="1"; shift ;;
+        *) break ;;
+    esac
+done
+
+is_safe_root_hook() {
+    local hook="$1"
+    [[ -f "$hook" && -x "$hook" && ! -L "$hook" ]] || return 1
+    local owner_mode
+    owner_mode=$(stat -c "%u:%g:%a" "$hook" 2>/dev/null || true)
+    [[ "$owner_mode" =~ ^0:0:[0-7][0145][0145]$ ]]
+}
+
+in_word_list() {
+    local needle="$1" list="$2" item
+    [[ -z "$needle" || -z "$list" ]] && return 1
+    for item in $list; do
+        [[ "$item" == "$needle" ]] && return 0
+    done
+    return 1
+}
+
+# ── Resolve TARGET_USER safely ────────────────────────────────────────────────
+CALLER_USER="${SUDO_USER:-}"
+if [[ -z "$CALLER_USER" && -n "${SUDO_UID:-}" ]]; then
+    CALLER_USER=$(id -nu "$SUDO_UID" 2>/dev/null || true)
+fi
+
+TARGET_USER=""
+if [[ -z "$CALLER_USER" || "$CALLER_USER" == "root" ]]; then
+    # Direct root invocation (e.g. root running enter-login-job <user>)
+    if [[ $# -ge 1 && "${1:-}" != -* && "${1:-}" != "container" && "${1:-}" != "host" ]]; then
+        TARGET_USER="$1"
+        shift
+    else
+        TARGET_USER="root"
+    fi
+elif in_word_list "$CALLER_USER" "$SHIM_USERS"; then
+    IDENTITY_HOOK="${GATEWAY_DIR}/hooks/identity"
+    if is_safe_root_hook "$IDENTITY_HOOK"; then
+        TARGET_USER=$("$IDENTITY_HOOK" 2>/dev/null | head -n 1 || true)
+    elif [[ $# -ge 1 && "${1:-}" != -* && "${1:-}" != "--mode" ]]; then
+        # Legacy switch-user.sh cutover fallback when SHIM_USERS explicitly permits CALLER_USER
+        TARGET_USER="$1"
+        shift
+    else
+        echo "ERROR: no valid root-owned identity hook at ${IDENTITY_HOOK} for shim user '${CALLER_USER}'." >&2
+        exit 1
+    fi
+    # Consume duplicate leading username argument if passed by legacy shim helper
+    if [[ $# -ge 1 && "${1:-}" == "$TARGET_USER" ]]; then
+        shift
+    fi
+else
+    # Standard Alliance flow: trust SUDO_USER exclusively
+    if [[ "${1:-}" == "--user" ]]; then
+        echo "ERROR: only root may specify --user (caller is '${CALLER_USER}')." >&2
+        exit 1
+    fi
+    TARGET_USER="$CALLER_USER"
+    if [[ $# -ge 1 && "${1:-}" == "$TARGET_USER" ]]; then
+        shift
+    elif [[ $# -ge 1 && "${1:-}" != -* && "${1:-}" != "container" && "${1:-}" != "host" ]]; then
+        echo "ERROR: only root may specify target user '${1}' (caller is '${CALLER_USER}')." >&2
+        exit 1
+    fi
+fi
+
+if [[ -z "$TARGET_USER" || ! "$TARGET_USER" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+    echo "ERROR: valid target user could not be resolved." >&2
+    exit 1
+fi
+
+PW_LINE=$(getent -s sss passwd "$TARGET_USER" 2>/dev/null || getent passwd "$TARGET_USER" 2>/dev/null || true)
+if [[ -z "$PW_LINE" ]]; then
+    echo "ERROR: unable to resolve cluster account '${TARGET_USER}'." >&2
+    exit 1
+fi
+IFS=":" read -r _pw_name _pw_x USER_UID USER_GID _pw_gecos USER_HOME USER_SHELL <<< "$PW_LINE"
+[[ -z "$USER_HOME" ]] && USER_HOME="/home/${TARGET_USER}"
+[[ -z "$USER_SHELL" || "$USER_SHELL" == *"/login-gateway/"* || "$USER_SHELL" == *"login-helper"* ]] && USER_SHELL="/bin/bash"
+
+if (( USER_UID < MIN_CLUSTER_UID )) && [[ "$TARGET_USER" != "root" ]]; then
+    echo "ERROR: refusing to route system account '${TARGET_USER}' (uid ${USER_UID})." >&2
+    exit 1
+fi
+
+IS_TTY=0
+if [[ -t 0 && ( -t 1 || -t 2 ) ]]; then
+    IS_TTY=1
+fi
+
+is_internal_client() {
+    local conn="${ORIG_SSH_CONNECTION:-}"
+    [[ -z "$conn" ]] && return 1
+    local client_ip="${conn%% *}"
+    python3 - "$client_ip" "$INTERNAL_CIDRS" << 'PYEOF' >/dev/null 2>&1
+import ipaddress, sys
+ip = ipaddress.ip_address(sys.argv[1])
+for raw in sys.argv[2].split(","):
+    raw = raw.strip()
+    if raw and ip in ipaddress.ip_network(raw, strict=False):
+        sys.exit(0)
+sys.exit(1)
+PYEOF
+}
+
+user_in_group_list() {
+    local target_groups="$1"
+    local user_groups
+    user_groups=" $(id -Gn "$TARGET_USER" 2>/dev/null || true) "
+    local g
+    for g in $target_groups; do
+        if [[ "$user_groups" == *" ${g} "* ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+run_optional_hook() {
+    local hook_name="$1"
+    shift
+    local hook_path="${GATEWAY_DIR}/hooks/${hook_name}"
+    if is_safe_root_hook "$hook_path"; then
+        "$hook_path" "$@" || true
+    fi
+}
+
+# ── 1. Detect Robot Session ──────────────────────────────────────────────────
+SESSION_MODE="login"
+if [[ "${LOGIN_GATEWAY_FORCE_ROBOT:-${LOGINBOX_FORCE_ROBOT:-0}}" == "1" || "$CLI_FORCE_ROBOT" == "1" ]]; then
+    SESSION_MODE="robot"
+fi
+
+if [[ $# -ge 2 && "${1:-}" == "-c" ]]; then
+    if [[ "${2:-}" == "__LOGIN_GATEWAY_ROBOT__ "* ]]; then
+        SESSION_MODE="robot"
+        set -- "-c" "${2#__LOGIN_GATEWAY_ROBOT__ }"
+    elif [[ "${2:-}" == "__LOGINBOX_ROBOT__ "* ]]; then
+        SESSION_MODE="robot"
+        set -- "-c" "${2#__LOGINBOX_ROBOT__ }"
+    fi
+fi
+
+if [[ "$ROBOT_MODE" == "port22" && "$ORIG_AUTH_TYPE" == "publickey" ]] && ! is_internal_client; then
+    # Defense-in-depth for shared Port-22 mode when MFA is keyboard-interactive only
+    if [[ $# -ge 2 && "${1:-}" == "-c" && "${2:-}" == *"allowed_commands"* ]]; then
+        SESSION_MODE="robot"
+    fi
+fi
+
+if [[ "$SESSION_MODE" == "robot" ]]; then
+    if [[ "$ROBOT_ENABLED" != "1" ]]; then
+        echo "ERROR: robot SSH automation is disabled on this gateway." >&2
+        exit 1
+    fi
+    if ! user_in_group_list "$ROBOT_GROUP"; then
+        echo "ERROR: user ${TARGET_USER} is not authorized for robot SSH access (${ROBOT_GROUP})." >&2
+        exit 1
+    fi
+    if [[ -n "$ORIG_SSH_ORIGINAL_COMMAND" ]]; then
+        export SSH_ORIGINAL_COMMAND="$ORIG_SSH_ORIGINAL_COMMAND"
+    fi
+fi
+
+# ── 2. Direct Gateway File Transfer Fast-Path (0 Slurm jobs) ─────────────────
+if [[ "$TRANSFER_FASTPATH" == "1" && $# -ge 2 && "${1:-}" == "-c" ]]; then
+    if classify_transfer_cmd "$2" "$ORIG_SSH_ORIGINAL_COMMAND"; then
+        run_optional_hook provision "$TARGET_USER" "transfer"
+        ls -d "${USER_HOME}/." >/dev/null 2>&1 || true
+        cd "$USER_HOME" 2>/dev/null || cd /tmp
+
+        XFER_ENV=(
+            HOME="$USER_HOME"
+            USER="$TARGET_USER"
+            LOGNAME="$TARGET_USER"
+            SHELL="$USER_SHELL"
+            PATH="/usr/local/bin:/usr/bin:/bin"
+            LANG="${LANG:-C.UTF-8}"
+        )
+        if [[ -n "${NORMALIZED_XFER_ORIG_CMD:-}" ]]; then
+            XFER_ENV+=(SSH_ORIGINAL_COMMAND="${NORMALIZED_XFER_ORIG_CMD}")
+        elif [[ -n "$ORIG_SSH_ORIGINAL_COMMAND" ]]; then
+            XFER_ENV+=(SSH_ORIGINAL_COMMAND="${ORIG_SSH_ORIGINAL_COMMAND}")
+        fi
+
+        if [[ -S /run/systemd/private ]] && command -v systemd-run >/dev/null 2>&1; then
+            exec systemd-run --quiet --scope \
+                --slice="$XFER_SLICE" \
+                --property="MemoryHigh=${XFER_MEM_HIGH}" \
+                --property="MemoryMax=${XFER_MEM_MAX}" \
+                --property="CPUQuota=${XFER_CPU_QUOTA}" \
+                --property="TasksMax=${XFER_TASKS_MAX}" \
+                env -i "${XFER_ENV[@]}" \
+                setpriv --reuid="$USER_UID" --regid="$USER_GID" --init-groups \
+                /bin/bash -c "$NORMALIZED_XFER_CMD"
+        else
+            exec env -i "${XFER_ENV[@]}" \
+                setpriv --reuid="$USER_UID" --regid="$USER_GID" --init-groups \
+                /bin/bash -c "$NORMALIZED_XFER_CMD"
+        fi
+    fi
+fi
+
+# ── 3. Maintenance check (/etc/nologin or /run/nologin) ──────────────────────
+if ! user_in_group_list "$GATEWAY_BYPASS_GROUPS"; then
+    for nologin_file in /etc/nologin /run/nologin; do
+        if [[ -f "$nologin_file" ]]; then
+            cat "$nologin_file" >&2 || echo "Cluster login is temporarily disabled for maintenance." >&2
+            exit 1
+        fi
+    done
+fi
+
+run_optional_hook provision "$TARGET_USER" "$SESSION_MODE"
+
+FORCE_CONTAINER="${LOGIN_GATEWAY_FORCE_CONTAINER:-${LOGINBOX_FORCE_CONTAINER:-0}}"
+FORCE_HOST="${LOGIN_GATEWAY_FORCE_HOST:-${LOGINBOX_FORCE_HOST:-0}}"
+FORCE_ADMIN="${LOGIN_GATEWAY_FORCE_ADMIN:-${LOGINBOX_FORCE_ADMIN:-0}}"
+[[ "$CLI_FORCE_CONTAINER" == "1" ]] && FORCE_CONTAINER="1"
+[[ "$CLI_FORCE_HOST" == "1" ]] && FORCE_HOST="1"
+[[ "$CLI_FORCE_ADMIN" == "1" ]] && FORCE_ADMIN="1"
+
+if [[ "${1:-}" == "container" ]]; then
+    FORCE_CONTAINER="1"
+    shift
+elif [[ "${1:-}" == "-c" && "${2:-}" == "container" ]]; then
+    FORCE_CONTAINER="1"
+    set --
+elif [[ "${1:-}" == "host" ]]; then
+    FORCE_HOST="1"
+    shift
+elif [[ "${1:-}" == "-c" && "${2:-}" == "host" ]]; then
+    FORCE_HOST="1"
+    set --
+fi
+
+# ── 4. Gateway host / rescue shell helper ────────────────────────────────────
+enter_gateway_host() {
+    local capped="${1:-0}"
+    shift || true
+    ls -d "${USER_HOME}/." >/dev/null 2>&1 || true
+
+    local rt_parent="/run/login-gateway/user-runtime"
+    local user_rt_dir="${rt_parent}/${USER_UID}"
+    mkdir -p "$rt_parent" "$user_rt_dir" 2>/dev/null || true
+    chmod 755 /run/login-gateway "$rt_parent" 2>/dev/null || true
+    chown "${USER_UID}:${USER_GID}" "$user_rt_dir" 2>/dev/null || true
+    chmod 700 "$user_rt_dir" 2>/dev/null || true
+
+    local host_env=(
+        HOME="$USER_HOME"
+        USER="$TARGET_USER"
+        LOGNAME="$TARGET_USER"
+        SHELL="$USER_SHELL"
+        TERM="$ORIG_TERM"
+        LANG="${LANG:-C.UTF-8}"
+        XDG_RUNTIME_DIR="$user_rt_dir"
+        PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    )
+    [[ -n "$ORIG_SSH_CONNECTION" ]] && host_env+=(SSH_CONNECTION="$ORIG_SSH_CONNECTION")
+
+    if [[ "$capped" != "1" && -n "$ORIG_DISPLAY" && -n "$ORIG_X11_COOKIE" ]]; then
+        local host_xauth="${user_rt_dir}/Xauthority"
+        touch "$host_xauth"
+        chmod 600 "$host_xauth"
+        read -r _x_disp _x_proto _x_hex <<< "$ORIG_X11_COOKIE"
+        if [[ -n "${_x_hex:-}" ]]; then
+            /usr/bin/xauth -f "$host_xauth" add "$ORIG_DISPLAY" "${_x_proto:-MIT-MAGIC-COOKIE-1}" "$_x_hex" >/dev/null 2>&1 || true
+            chown "${USER_UID}:${USER_GID}" "$host_xauth" 2>/dev/null || true
+            host_env+=(DISPLAY="$ORIG_DISPLAY" XAUTHORITY="$host_xauth")
+        fi
+    fi
+
+    if [[ "$capped" != "1" && -n "$ORIG_AUTH_SOCK" && -S "$ORIG_AUTH_SOCK" ]]; then
+        local sock_dir
+        sock_dir=$(dirname "$ORIG_AUTH_SOCK")
+        if [[ "$sock_dir" == /tmp/ssh-* ]]; then
+            chown -R "${USER_UID}:${USER_GID}" "$sock_dir" 2>/dev/null || true
+            host_env+=(SSH_AUTH_SOCK="$ORIG_AUTH_SOCK")
+        fi
+    fi
+
+    if [[ "$IS_TTY" -eq 1 ]]; then
+        local tty_dev
+        tty_dev=$(tty 2>/dev/null || true)
+        if [[ "$tty_dev" == /dev/pts/* ]]; then
+            chown "${USER_UID}:tty" "$tty_dev" 2>/dev/null || true
+            chmod 620 "$tty_dev" 2>/dev/null || true
+        fi
+        if [[ $# -eq 0 && "${MOTD_SHOWN:-0}" != "1" && "$STATUS_ENABLED" != "1" && ! -f "${USER_HOME}/.hushlogin" && -f /etc/motd ]]; then
+            cat /etc/motd
+        fi
+    fi
+
+    cd "$USER_HOME" 2>/dev/null || cd /tmp
+    local runner=()
+    if [[ "$capped" == "1" && -S /run/systemd/private ]] && command -v systemd-run >/dev/null 2>&1; then
+        runner=(
+            systemd-run --quiet --scope
+            --slice="$XFER_SLICE"
+            --property="MemoryMax=${FALLBACK_MEM_MAX}"
+            --property="CPUQuota=${FALLBACK_CPU_QUOTA}"
+            --property="TasksMax=${FALLBACK_TASKS_MAX}"
+        )
+    fi
+
+    if [[ $# -eq 0 ]]; then
+        exec "${runner[@]}" env -i "${host_env[@]}" \
+            setpriv --reuid="$USER_UID" --regid="$USER_GID" --init-groups \
+            "$USER_SHELL" -l
+    elif [[ "${1:-}" == "-c" && $# -ge 2 ]]; then
+        exec "${runner[@]}" env -i "${host_env[@]}" \
+            setpriv --reuid="$USER_UID" --regid="$USER_GID" --init-groups \
+            "$USER_SHELL" -c "$2"
+    else
+        exec "${runner[@]}" env -i "${host_env[@]}" \
+            setpriv --reuid="$USER_UID" --regid="$USER_GID" --init-groups \
+            "$@"
+    fi
+}
+
+# ── 5. Slurm Pod Routing (`login-<user>` / `admin-<user>` / `robot-<user>`) ──
+ROUTE_DIR="/run/login-gateway/routes"
+[[ ! -d /run/login-gateway && -d /run/loginbox/routes ]] && ROUTE_DIR="/run/loginbox/routes"
+
+apply_session_route() {
+    if [[ "$SESSION_MODE" == "robot" ]]; then
+        JOB_NAME="robot-${TARGET_USER}"
+        ROUTE_FILE="${ROUTE_DIR}/robot-${TARGET_USER}"
+    elif [[ "$SESSION_MODE" == "admin" ]]; then
+        JOB_NAME="admin-${TARGET_USER}"
+        ROUTE_FILE="${ROUTE_DIR}/admin-${TARGET_USER}"
+    else
+        JOB_NAME="login-${TARGET_USER}"
+        ROUTE_FILE="${ROUTE_DIR}/${TARGET_USER}"
+    fi
+}
+
+PROXY_KEY=""
+for candidate_key in \
+    "${GATEWAY_DIR}/proxy_id_ed25519" \
+    "/etc/login-gateway/proxy_id_ed25519" \
+    "/etc/loginbox/proxy_id_ed25519"; do
+    if [[ -f "$candidate_key" ]]; then
+        PROXY_KEY="$candidate_key"
+        break
+    fi
+done
+
+if [[ -z "$PROXY_KEY" ]]; then
+    echo "ERROR: gateway SSH proxy key not found (enable login-gateway-keygen.service)." >&2
+    exit 1
+fi
+
+SSH_EXTRA_FLAGS=()
+TEMP_XAUTH=""
+TEMP_KNOWN_HOSTS=""
+cleanup_temp() {
+    [[ -n "$TEMP_XAUTH" && -f "$TEMP_XAUTH" ]] && rm -f "$TEMP_XAUTH"
+    [[ -n "$TEMP_KNOWN_HOSTS" && -f "$TEMP_KNOWN_HOSTS" ]] && rm -f "$TEMP_KNOWN_HOSTS"
+}
+trap cleanup_temp EXIT
+
+if [[ "$SESSION_MODE" != "robot" ]]; then
+    if [[ -n "$ORIG_DISPLAY" && -n "$ORIG_X11_COOKIE" ]]; then
+        mkdir -p /run/login-gateway/xauth 2>/dev/null || true
+        chmod 700 /run/login-gateway/xauth 2>/dev/null || true
+        TEMP_XAUTH="/run/login-gateway/xauth/xauth.${TARGET_USER}.$$"
+        touch "$TEMP_XAUTH"
+        chmod 600 "$TEMP_XAUTH"
+        read -r _x_disp _x_proto _x_hex <<< "$ORIG_X11_COOKIE"
+        if [[ -n "${_x_hex:-}" ]]; then
+            /usr/bin/xauth -f "$TEMP_XAUTH" add "$ORIG_DISPLAY" "${_x_proto:-MIT-MAGIC-COOKIE-1}" "$_x_hex" >/dev/null 2>&1 || true
+            export DISPLAY="$ORIG_DISPLAY"
+            export XAUTHORITY="$TEMP_XAUTH"
+            SSH_EXTRA_FLAGS+=("-Y")
+        fi
+    fi
+
+    if [[ -n "$ORIG_AUTH_SOCK" && -S "$ORIG_AUTH_SOCK" ]]; then
+        export SSH_AUTH_SOCK="$ORIG_AUTH_SOCK"
+        SSH_EXTRA_FLAGS+=("-A")
+    fi
+fi
+
+export TERM="$ORIG_TERM"
+
+tcp_probe() {
+    local host="$1" port="$2"
+    timeout 0.2 bash -c "</dev/tcp/${host}/${port}" >/dev/null 2>&1
+}
+
+slurm_controller_reachable() {
+    timeout 2 scontrol ping 2>/dev/null | grep -q "is UP"
+}
+
+resolve_or_spawn() {
+    mkdir -p "$ROUTE_DIR" 2>/dev/null || true
+    chmod 755 "$(dirname "$ROUTE_DIR")" "$ROUTE_DIR" 2>/dev/null || true
+
+    local queue_user="$TARGET_USER"
+    local queue_part="$LOGIN_PARTITION"
+    if [[ "$SESSION_MODE" == "admin" ]]; then
+        queue_user="root"
+        queue_part="$ADMIN_PARTITION"
+    fi
+
+    local job_info
+    job_info=$(timeout 4 squeue -h -u "$queue_user" -p "$queue_part" -n "$JOB_NAME" -t R -o "%i|%N|%k" 2>/dev/null | head -n 1 || true)
+    if [[ -n "$job_info" ]]; then
+        IFS="|" read -r s_jid _s_node s_comment <<< "$job_info"
+        if [[ "$s_comment" == *:*:* ]]; then
+            IFS=":" read -r c_node c_port c_fp <<< "$s_comment"
+            if [[ -n "$c_node" && -n "$c_port" ]] && tcp_probe "$c_node" "$c_port"; then
+                echo "${s_jid}|${c_node}|${c_port}|${c_fp}" > "$ROUTE_FILE" 2>/dev/null || true
+                chmod 644 "$ROUTE_FILE" 2>/dev/null || true
+                JID="$s_jid"
+                CNODE="$c_node"
+                CPORT="$c_port"
+                CFP="$c_fp"
+                return 0
+            fi
+        fi
+    fi
+
+    if [[ "$IS_TTY" -eq 1 && "$SESSION_MODE" != "robot" ]]; then
+        if [[ "$SESSION_MODE" == "admin" ]]; then
+            echo "Starting admin root pod (${JOB_NAME})..." >&2
+        else
+            echo "Starting login pod (${JOB_NAME})..." >&2
+        fi
+    fi
+
+    local spawn_out
+    if ! spawn_out=$("${SCRIPT_DIR}/spawn" --mode "$SESSION_MODE" --user "$TARGET_USER"); then
+        return 1
+    fi
+    spawn_out=$(echo "$spawn_out" | tail -n 1)
+    IFS="|" read -r JID CNODE CPORT CFP <<< "$spawn_out"
+    return 0
+}
+
+run_ssh_attach() {
+    local node="$1" port="$2" cfp="$3"
+    shift 3
+
+    local hk_opts=(-o "UserKnownHostsFile=/dev/null" -o "StrictHostKeyChecking=no")
+    if [[ "$cfp" == *,* ]]; then
+        local pub_b64="${cfp#*,}"
+        if [[ -n "$pub_b64" ]]; then
+            mkdir -p /run/login-gateway/known_hosts 2>/dev/null || true
+            chmod 700 /run/login-gateway/known_hosts 2>/dev/null || true
+            TEMP_KNOWN_HOSTS="/run/login-gateway/known_hosts/kh.${TARGET_USER}.$$"
+            printf '[%s]:%s ssh-ed25519 %s\n' "$node" "$port" "$pub_b64" > "$TEMP_KNOWN_HOSTS"
+            chmod 600 "$TEMP_KNOWN_HOSTS"
+            hk_opts=(-o "UserKnownHostsFile=${TEMP_KNOWN_HOSTS}" -o "StrictHostKeyChecking=yes")
+        fi
+    fi
+
+    local send_env="LANG LC_*"
+    if [[ -n "${SSH_ORIGINAL_COMMAND:-}" ]]; then
+        send_env="LANG LC_* SSH_ORIGINAL_COMMAND"
+    fi
+
+    local ssh_base=(
+        /usr/bin/ssh
+        -i "$PROXY_KEY"
+        -p "$port"
+        -o "ConnectTimeout=2"
+        "${hk_opts[@]}"
+        -o "LogLevel=ERROR"
+        -o "ControlMaster=no"
+        -o "ControlPath=none"
+        -o "PreferredAuthentications=publickey"
+        -o "SendEnv=${send_env}"
+    )
+    if [[ $# -eq 0 ]]; then
+        local flags=("${SSH_EXTRA_FLAGS[@]}")
+        [[ "$IS_TTY" -eq 1 ]] && flags+=("-t")
+        "${ssh_base[@]}" "${flags[@]}" "${TARGET_USER}@${node}"
+        return $?
+    elif [[ "${1:-}" == "-c" && $# -ge 2 ]]; then
+        "${ssh_base[@]}" "${SSH_EXTRA_FLAGS[@]}" "${TARGET_USER}@${node}" "$2"
+        return $?
+    else
+        "${ssh_base[@]}" "${SSH_EXTRA_FLAGS[@]}" "${TARGET_USER}@${node}" "$@"
+        return $?
+    fi
+}
+
+maybe_print_motd() {
+    if [[ $# -eq 0 && "$IS_TTY" -eq 1 && "$SESSION_MODE" != "robot" && "${MOTD_SHOWN:-0}" != "1" ]]; then
+        ls -d "${USER_HOME}/." >/dev/null 2>&1 || true
+        if [[ ! -f "${USER_HOME}/.hushlogin" ]]; then
+            if is_safe_root_hook "${GATEWAY_DIR}/hooks/motd"; then
+                "${GATEWAY_DIR}/hooks/motd" "$TARGET_USER" || true
+            elif [[ "$STATUS_ENABLED" != "1" && -f /etc/motd ]]; then
+                cat /etc/motd
+            fi
+        fi
+        MOTD_SHOWN=1
+    fi
+}
+
+attach_routed_session() {
+    SPAWN_FAILED=0
+    if [[ -r "$ROUTE_FILE" ]]; then
+        IFS="|" read -r JID CNODE CPORT CFP < "$ROUTE_FILE" || true
+        if [[ -n "${CNODE:-}" && -n "${CPORT:-}" ]]; then
+            run_ssh_attach "$CNODE" "$CPORT" "${CFP:-}" "$@"
+            local rc=$?
+            if [[ "$rc" -ne 255 ]]; then
+                return "$rc"
+            fi
+        fi
+        rm -f "$ROUTE_FILE" 2>/dev/null || true
+    fi
+
+    JID=""
+    CNODE=""
+    CPORT=""
+    CFP=""
+    if ! resolve_or_spawn; then
+        SPAWN_FAILED=1
+        return 1
+    fi
+    run_ssh_attach "$CNODE" "$CPORT" "${CFP:-}" "$@"
+    return $?
+}
+
+want_admin_pod() {
+    [[ "$SESSION_MODE" == "login" ]] || return 1
+    [[ "$FORCE_HOST" == "1" || "$FORCE_CONTAINER" == "1" ]] && return 1
+    user_in_group_list "$GATEWAY_BYPASS_GROUPS" || return 1
+    if [[ "$FORCE_ADMIN" == "1" ]]; then
+        return 0
+    fi
+    [[ "$ADMIN_POD_ENABLED" == "1" ]]
+}
+
+if [[ "$FORCE_ADMIN" == "1" ]]; then
+    if ! user_in_group_list "$GATEWAY_BYPASS_GROUPS"; then
+        echo "ERROR: ${TARGET_USER} is not authorized for an admin root pod (${GATEWAY_BYPASS_GROUPS})." >&2
+        exit 1
+    fi
+fi
+
+if want_admin_pod; then
+    SESSION_MODE="admin"
+    apply_session_route
+    maybe_print_motd "$@"
+    attach_routed_session "$@"
+    rc=$?
+    if [[ "$SPAWN_FAILED" == "1" || "$rc" -eq 255 ]]; then
+        echo "Admin root pod unavailable; falling back to the gateway host shell." >&2
+        SESSION_MODE="login"
+        enter_gateway_host 0 "$@"
+    fi
+    exit "$rc"
+fi
+
+if [[ "$SESSION_MODE" == "login" && "$FORCE_CONTAINER" != "1" ]] && user_in_group_list "$GATEWAY_BYPASS_GROUPS"; then
+    enter_gateway_host 0 "$@"
+fi
+
+apply_session_route
+maybe_print_motd "$@"
+attach_routed_session "$@"
+rc=$?
+if [[ "$SPAWN_FAILED" == "1" ]]; then
+    if [[ "$SESSION_MODE" == "login" && "$SLURM_DOWN_FALLBACK" == "restricted-shell" ]] && ! slurm_controller_reachable; then
+        echo "WARNING: Slurm controller is temporarily unreachable; opening a resource-capped rescue shell on the login gateway." >&2
+        enter_gateway_host 1 "$@"
+    fi
+    echo "Unable to start ${SESSION_MODE} pod (${JOB_NAME}). Check cluster capacity or contact support." >&2
+    exit 1
+fi
+exit "$rc"

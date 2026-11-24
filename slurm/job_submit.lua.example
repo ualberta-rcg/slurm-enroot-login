@@ -1,0 +1,22 @@
+-- /etc/slurm/job_submit.lua — login partition exemption snippet
+-- Many Alliance clusters auto-inject default walltimes (e.g. 60 minutes),
+-- default compute features, or billing account checks in job_submit.lua.
+-- Exempt the `login` partition so 7-day `login-<user>` and `robot-<user>`
+-- pods are not clamped to short compute defaults or forced onto GPU features.
+
+function slurm_job_submit(job_desc, part_list, submit_uid)
+    local part = tostring(job_desc.partition or "")
+    if part == "login" then
+        return slurm.SUCCESS
+    end
+
+    -- Existing site compute routing / default walltime logic continues below:
+    if job_desc.time_limit == nil or job_desc.time_limit == slurm.NO_VAL then
+        job_desc.time_limit = 60
+    end
+    return slurm.SUCCESS
+end
+
+function slurm_job_modify(job_desc, job_rec, part_list, modify_uid)
+    return slurm.SUCCESS
+end

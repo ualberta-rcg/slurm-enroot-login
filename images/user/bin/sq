@@ -1,0 +1,39 @@
+#!/bin/bash
+# /usr/local/bin/sq — Alliance-compatible per-user Slurm queue view
+# Hides persistent login/robot/admin session pods by default; pass --pods to include them.
+set -euo pipefail
+
+SHOW_PODS=0
+HAS_USER_FILTER=0
+ARGS=()
+
+for arg in "$@"; do
+    case "$arg" in
+        --pods|--all-pods)
+            SHOW_PODS=1
+            ;;
+        -u|--user|--users|-a|--all|-u*|--user=*)
+            HAS_USER_FILTER=1
+            ARGS+=("$arg")
+            ;;
+        *)
+            ARGS+=("$arg")
+            ;;
+    esac
+done
+
+USER_FLAG=()
+if [[ "$HAS_USER_FILTER" -eq 0 ]]; then
+    USER_FLAG=("-u" "${USER:-$(id -un)}")
+fi
+
+FMT="%.12i %.10P %.22j %.10u %.2t %.10M %.10l %.4D %R"
+if [[ "$SHOW_PODS" -eq 1 ]]; then
+    exec squeue "${USER_FLAG[@]}" -o "$FMT" "${ARGS[@]}"
+fi
+
+squeue "${USER_FLAG[@]}" -o "$FMT" "${ARGS[@]}" | awk '
+    NR == 1 { print; next }
+    $3 ~ /^(login|robot|admin)-/ { next }
+    { print }
+'

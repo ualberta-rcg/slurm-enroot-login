@@ -1,0 +1,138 @@
+#!/bin/bash
+# /usr/local/libexec/login-gateway/dispatch
+# OpenSSH ForceCommand (login gateway) and authorized_keys command= wrapper
+# (robot gateway). Runs unprivileged as the authenticated user.
+#
+# 1. Classifies SSH_ORIGINAL_COMMAND (and any forced robot command=).
+#    For standard SSSD/LDAP users (not in SHIM_USERS), validated scp/sftp/rsync
+#    transfers execute immediately on the gateway as the user with zero sudo
+#    escalation and zero Slurm jobs.
+# 2. Everything else (interactive shells, IDE tunnels, remote commands, and
+#    SHIM_USERS sessions requiring hooks/identity) hands off via `sudo -n` to
+#    `route`, which derives identity strictly from SUDO_USER.
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+for candidate_conf in \
+    "${LOGIN_GATEWAY_CONF:-}" \
+    "/etc/login-gateway/login-gateway.conf" \
+    "/etc/loginbox/loginbox.conf"; do
+    if [[ -n "$candidate_conf" && -r "$candidate_conf" ]]; then
+        # shellcheck disable=SC1090
+        source "$candidate_conf"
+        break
+    fi
+done
+
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/classify-transfer"
+
+TRANSFER_FASTPATH="${TRANSFER_FASTPATH:-1}"
+SHIM_USERS="${SHIM_USERS:-}"
+FORCE_ROBOT="${LOGIN_GATEWAY_FORCE_ROBOT:-${LOGINBOX_FORCE_ROBOT:-}}"
+FORCED_CMD=""
+HAS_FORCED_CMD=0
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --robot)
+            FORCE_ROBOT="1"
+            shift
+            ;;
+        --orig-cmd)
+            FORCED_CMD=$(printf '%s' "${2:-}" | base64 -d 2>/dev/null || true)
+            HAS_FORCED_CMD=1
+            shift 2
+            ;;
+        --)
+            shift
+            FORCED_CMD="$*"
+            HAS_FORCED_CMD=1
+            break
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+in_word_list() {
+    local needle="$1" list="$2" item
+    [[ -z "$needle" || -z "$list" ]] && return 1
+    for item in $list; do
+        [[ "$item" == "$needle" ]] && return 0
+    done
+    return 1
+}
+
+CURRENT_USER="${USER:-$(id -un 2>/dev/null || true)}"
+
+# Fast-path transfers directly as the authenticated user when not using a
+# synthetic shim account (shim accounts delegate to `route` so hooks/identity
+# switches UID to the real user inside login-gateway-xfer.slice).
+if [[ "$TRANSFER_FASTPATH" == "1" ]] && ! in_word_list "$CURRENT_USER" "$SHIM_USERS"; then
+    CANDIDATE_CMD="${SSH_ORIGINAL_COMMAND:-}"
+    [[ "$HAS_FORCED_CMD" -eq 1 ]] && CANDIDATE_CMD="$FORCED_CMD"
+    if [[ -n "$CANDIDATE_CMD" ]] && classify_transfer_cmd "$CANDIDATE_CMD" "${SSH_ORIGINAL_COMMAND:-}"; then
+        export SSH_ORIGINAL_COMMAND="${NORMALIZED_XFER_ORIG_CMD}"
+        read -r -a XFER_ARGV <<< "$NORMALIZED_XFER_CMD"
+        if [[ "${XFER_ARGV[0]}" == "/usr/bin/scp" ]] && ! [[ -x /usr/bin/scp ]]; then
+            XFER_ARGV[0]="scp"
+        elif [[ "${XFER_ARGV[0]}" == "/usr/bin/rsync" ]] && ! [[ -x /usr/bin/rsync ]]; then
+            XFER_ARGV[0]="rsync"
+        fi
+        if command -v systemd-run >/dev/null 2>&1 && [[ -n "${XDG_RUNTIME_DIR:-}" ]]; then
+            systemd-run --user --scope --quiet \
+                -p "MemoryMax=${XFER_MEM_MAX:-512M}" \
+                -p "CPUQuota=${XFER_CPU_QUOTA:-100%}" \
+                -- "${XFER_ARGV[@]}" && exit 0
+        fi
+        exec "${XFER_ARGV[@]}"
+    fi
+fi
+
+X11_COOKIE=""
+if [[ -n "${DISPLAY:-}" && "$FORCE_ROBOT" != "1" ]]; then
+    X11_COOKIE=$(/usr/bin/xauth list "$DISPLAY" 2>/dev/null | head -n 1 || true)
+fi
+
+AUTH_TYPE=""
+if [[ -n "${SSH_USER_AUTH:-}" && -r "${SSH_USER_AUTH}" ]]; then
+    AUTH_TYPE=$(awk 'NR==1 {print $1}' "${SSH_USER_AUTH}" 2>/dev/null || true)
+fi
+
+ROUTE_ARGS=()
+[[ "$FORCE_ROBOT" == "1" ]] && ROUTE_ARGS+=("--robot")
+if [[ "$HAS_FORCED_CMD" -eq 1 ]]; then
+    ROUTE_ARGS+=("-c" "$FORCED_CMD")
+elif [[ $# -gt 0 ]]; then
+    ROUTE_ARGS+=("$@")
+elif [[ -n "${SSH_ORIGINAL_COMMAND:-}" ]]; then
+    ROUTE_ARGS+=("-c" "${SSH_ORIGINAL_COMMAND}")
+fi
+
+SUDO_BIN="${LOGIN_GATEWAY_SUDO_BIN:-sudo}"
+if [[ "$SUDO_BIN" == "sudo" && -x /usr/bin/sudo ]]; then
+    # Allow PATH override in tests when LOGIN_GATEWAY_SUDO_BIN is unset only if /usr/bin/sudo isn't forced
+    SUDO_BIN=$(command -v sudo 2>/dev/null || echo /usr/bin/sudo)
+fi
+ROUTE_BIN="${LOGIN_GATEWAY_ROUTE_BIN:-/usr/local/libexec/login-gateway/route}"
+if [[ ! -x "$ROUTE_BIN" && -x "${SCRIPT_DIR}/route" ]]; then
+    ROUTE_BIN="${SCRIPT_DIR}/route"
+fi
+
+exec "$SUDO_BIN" -n \
+    LOGIN_GATEWAY_ORIG_DISPLAY="${DISPLAY:-}" \
+    LOGIN_GATEWAY_ORIG_X11_COOKIE="${X11_COOKIE:-}" \
+    LOGIN_GATEWAY_ORIG_AUTH_SOCK="${SSH_AUTH_SOCK:-}" \
+    LOGIN_GATEWAY_ORIG_TERM="${TERM:-xterm-256color}" \
+    LOGIN_GATEWAY_ORIG_SSH_CONNECTION="${SSH_CONNECTION:-}" \
+    LOGIN_GATEWAY_ORIG_SSH_ORIGINAL_COMMAND="${SSH_ORIGINAL_COMMAND:-}" \
+    LOGIN_GATEWAY_ORIG_AUTH_TYPE="${AUTH_TYPE:-}" \
+    LOGIN_GATEWAY_FORCE_CONTAINER="${LOGIN_GATEWAY_FORCE_CONTAINER:-${LOGINBOX_FORCE_CONTAINER:-}}" \
+    LOGIN_GATEWAY_FORCE_ROBOT="${FORCE_ROBOT}" \
+    LOGIN_GATEWAY_FORCE_ADMIN="${LOGIN_GATEWAY_FORCE_ADMIN:-${LOGINBOX_FORCE_ADMIN:-}}" \
+    LOGIN_GATEWAY_FORCE_HOST="${LOGIN_GATEWAY_FORCE_HOST:-${LOGINBOX_FORCE_HOST:-}}" \
+    LOGIN_GATEWAY_SHIM_HINT="${LOGIN_GATEWAY_SHIM_HINT:-${PAM_OAUTH2_PROVISIONED_USER:-}}" \
+    "$ROUTE_BIN" "${ROUTE_ARGS[@]}"

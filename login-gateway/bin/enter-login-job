@@ -1,0 +1,34 @@
+#!/bin/bash
+# /usr/local/bin/enter-login-job
+# Convenience helper for gateway admins (gateway-admins / ccstaff):
+#   enter-login-job              # unprivileged login-<user> pod
+#   enter-login-job -c "cmd"
+#   enter-login-job --robot -c "cmd"
+#   enter-login-job --admin      # root-capable admin-<user> pod
+#   enter-login-job --host       # gateway host shell (skip the admin pod)
+set -euo pipefail
+
+MODE_FLAGS=("--force-container")
+case "${1:-}" in
+    --robot)
+        MODE_FLAGS=("--force-container" "--force-robot")
+        shift
+        ;;
+    --admin)
+        MODE_FLAGS=("--force-admin")
+        shift
+        ;;
+    --host)
+        MODE_FLAGS=("--force-host")
+        shift
+        ;;
+esac
+
+CURRENT_USER=$(id -un)
+USER_ARGS=()
+if [[ "$CURRENT_USER" == "root" && -n "${1:-}" && "${1:-}" != -* ]]; then
+    USER_ARGS=("$1")
+    shift
+fi
+
+exec sudo /usr/local/libexec/login-gateway/route "${MODE_FLAGS[@]}" "${USER_ARGS[@]}" "$@"

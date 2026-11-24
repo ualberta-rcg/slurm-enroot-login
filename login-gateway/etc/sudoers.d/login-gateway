@@ -1,0 +1,8 @@
+# /etc/sudoers.d/login-gateway
+# Allows ForceCommand (/usr/local/libexec/login-gateway/dispatch) running as an
+# authenticated cluster user to invoke the root session router.
+# Security: route derives the target user strictly from SUDO_USER (ignoring CLI
+# user arguments unless invoked by root or an explicitly configured SHIM_USERS hook).
+Defaults!/usr/local/libexec/login-gateway/route !lecture, !authenticate
+Defaults!/usr/local/libexec/login-gateway/route env_keep += "LOGIN_GATEWAY_ORIG_DISPLAY LOGIN_GATEWAY_ORIG_X11_COOKIE LOGIN_GATEWAY_ORIG_AUTH_SOCK LOGIN_GATEWAY_ORIG_TERM LOGIN_GATEWAY_ORIG_SSH_CONNECTION LOGIN_GATEWAY_ORIG_SSH_ORIGINAL_COMMAND LOGIN_GATEWAY_ORIG_AUTH_TYPE LOGIN_GATEWAY_FORCE_CONTAINER LOGIN_GATEWAY_FORCE_ROBOT LOGIN_GATEWAY_FORCE_ADMIN LOGIN_GATEWAY_FORCE_HOST LOGIN_GATEWAY_SHIM_HINT"
+ALL ALL=(root) NOPASSWD: SETENV: /usr/local/libexec/login-gateway/route

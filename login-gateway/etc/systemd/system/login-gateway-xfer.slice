@@ -1,0 +1,13 @@
+[Unit]
+Description=Login Gateway Direct File Transfer Slice (scp / sftp / rsync)
+Documentation=https://github.com/ualberta-rcg/slurm-login-pods
+Before=slices.target
+
+[Slice]
+MemoryAccounting=yes
+CPUAccounting=yes
+TasksAccounting=yes
+MemoryHigh=2G
+MemoryMax=4G
+CPUQuota=400%
+TasksMax=512

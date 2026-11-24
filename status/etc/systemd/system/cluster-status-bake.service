@@ -1,0 +1,13 @@
+[Unit]
+Description=Bake cluster-status Slurm snapshot cache on gateway hosts
+After=network.target slurmd.service munge.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/cluster-status-bake
+Nice=19
+IOSchedulingClass=idle
+TimeoutStartSec=60
+
+[Install]
+WantedBy=multi-user.target

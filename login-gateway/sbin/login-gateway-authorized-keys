@@ -1,0 +1,136 @@
+#!/bin/bash
+# /usr/local/sbin/login-gateway-authorized-keys
+# OpenSSH AuthorizedKeysCommand helper for login-gateway nodes:
+#   login-gateway-authorized-keys internal <username>
+#     Used inside `Match Address <INTERNAL_CIDRS>` (Open OnDemand Shell app,
+#     compute nodes, peer gateways). Returns SSSD/LDAP keys plus strictly
+#     permission-verified ~/.ssh/authorized_keys.
+#
+#   login-gateway-authorized-keys external <username>
+#     - When ROBOT_MODE="port22" (shared Port-22 multiplexing): delegates to
+#       sss_ssh_authorizedkeys.filter --inject-robot-marker so ONLY constrained
+#       robot keys pass publickey auth while normal users fall through to MFA.
+#     - When ROBOT_MODE="dedicated" (standard Alliance login node): returns
+#       standard CCDB/LDAP public keys via /usr/bin/sss_ssh_authorizedkeys
+#       (paired with AuthenticationMethods publickey,keyboard-interactive:pam).
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+for candidate_conf in \
+    "${LOGIN_GATEWAY_CONF:-}" \
+    "/etc/login-gateway/login-gateway.conf" \
+    "/etc/loginbox/loginbox.conf"; do
+    if [[ -n "$candidate_conf" && -r "$candidate_conf" ]]; then
+        # shellcheck disable=SC1090
+        source "$candidate_conf"
+        break
+    fi
+done
+
+MIN_CLUSTER_UID="${MIN_CLUSTER_UID:-10000}"
+ROBOT_MODE="${ROBOT_MODE:-dedicated}"
+SHIM_USERS="${SHIM_USERS:-}"
+
+MODE="${1:-external}"
+TARGET_USER="${2:-}"
+
+in_word_list() {
+    local needle="$1" list="$2" item
+    [[ -z "$needle" || -z "$list" ]] && return 1
+    for item in $list; do
+        [[ "$item" == "$needle" ]] && return 0
+    done
+    return 1
+}
+
+if in_word_list "$TARGET_USER" "$SHIM_USERS" && [[ -r "/proc/${PPID}/cmdline" ]]; then
+    PPID_CMD=$(tr '\0' ' ' < "/proc/${PPID}/cmdline" 2>/dev/null || true)
+    if [[ "$PPID_CMD" =~ ^sshd:[[:space:]]+([a-zA-Z0-9._-]+)[[:space:]]+\[priv\] ]]; then
+        TARGET_USER="${BASH_REMATCH[1]}"
+    fi
+fi
+
+if [[ -z "$TARGET_USER" || ! "$TARGET_USER" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+    exit 0
+fi
+
+case "$TARGET_USER" in
+    root|sshd|munge|slurm|nobody|ubuntu|www-data)
+        exit 0
+        ;;
+esac
+if in_word_list "$TARGET_USER" "$SHIM_USERS"; then
+    exit 0
+fi
+
+if [[ "$MODE" == "external" ]]; then
+    if [[ "$ROBOT_MODE" == "port22" ]]; then
+        FILTER_SH="${SCRIPT_DIR}/sss_ssh_authorizedkeys.filter"
+        [[ ! -x "$FILTER_SH" ]] && FILTER_SH="/usr/local/sbin/sss_ssh_authorizedkeys.filter"
+        exec "$FILTER_SH" --inject-robot-marker "$TARGET_USER"
+    fi
+    if [[ -x /usr/bin/sss_ssh_authorizedkeys ]]; then
+        exec /usr/bin/sss_ssh_authorizedkeys "$TARGET_USER" 2>/dev/null
+    fi
+    exit 0
+fi
+
+if [[ "$MODE" != "internal" ]]; then
+    exit 0
+fi
+
+PW_LINE=$(getent -s sss passwd "$TARGET_USER" 2>/dev/null || getent -s files passwd "$TARGET_USER" 2>/dev/null || true)
+if [[ -z "$PW_LINE" ]]; then
+    exit 0
+fi
+
+IFS=":" read -r _pw_name _pw_x USER_UID _pw_gid _pw_gecos USER_HOME _pw_shell <<< "$PW_LINE"
+if [[ -z "${USER_UID:-}" ]] || (( USER_UID < MIN_CLUSTER_UID )); then
+    exit 0
+fi
+
+if [[ -x /usr/bin/sss_ssh_authorizedkeys ]]; then
+    /usr/bin/sss_ssh_authorizedkeys "$TARGET_USER" 2>/dev/null || true
+fi
+
+if [[ -n "$USER_HOME" ]]; then
+    python3 - "$USER_HOME" "$USER_UID" << 'PYEOF'
+import os, stat, sys
+
+homedir = sys.argv[1]
+expected_uid = int(sys.argv[2])
+
+def check_dir(path, allow_root=False):
+    st = os.lstat(path)
+    if not stat.S_ISDIR(st.st_mode):
+        return False
+    if st.st_uid != expected_uid and not (allow_root and st.st_uid == 0):
+        return False
+    if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        return False
+    return True
+
+try:
+    if not check_dir(homedir, allow_root=True):
+        sys.exit(0)
+    ssh_dir = os.path.join(homedir, ".ssh")
+    if not check_dir(ssh_dir, allow_root=False):
+        sys.exit(0)
+    ak_path = os.path.join(ssh_dir, "authorized_keys")
+    st_ak = os.lstat(ak_path)
+    if not stat.S_ISREG(st_ak.st_mode):
+        sys.exit(0)
+    if st_ak.st_uid != expected_uid:
+        sys.exit(0)
+    if st_ak.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        sys.exit(0)
+    fd = os.open(ak_path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, "r", encoding="utf-8", errors="replace") as fh:
+        sys.stdout.write(fh.read())
+except OSError:
+    sys.exit(0)
+PYEOF
+fi
+
+exit 0

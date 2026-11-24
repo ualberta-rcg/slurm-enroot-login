@@ -1,0 +1,16 @@
+# /etc/ssh/sshd_config.d/login.conf
+# Standard Alliance login-gateway policy (login.<cluster>):
+#   1. Require SSH public key (from CCDB/LDAP via SSSD) + Duo MFA.
+#   2. Route every session through /usr/local/libexec/login-gateway/dispatch:
+#      - scp / sftp / rsync execute immediately on the gateway in a capped slice.
+#      - Interactive shells, IDEs, and commands route into the user's login-<user> pod.
+PasswordAuthentication no
+KbdInteractiveAuthentication yes
+AuthenticationMethods publickey,keyboard-interactive:pam
+AuthorizedKeysFile /dev/null
+AuthorizedKeysCommand /usr/bin/sss_ssh_authorizedkeys
+AuthorizedKeysCommandUser nobody
+AllowTcpForwarding yes
+AllowAgentForwarding yes
+X11Forwarding yes
+ForceCommand /usr/local/libexec/login-gateway/dispatch

@@ -2,3 +2,4 @@ __pycache__/
 *.py[cod]
 debs/
 test-slurm.conf
+tests/.tmp_test_*

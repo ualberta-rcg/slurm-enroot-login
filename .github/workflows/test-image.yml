@@ -1,17 +1,13 @@
 # =============================================================================
-# Login Image & Gateway Suite Test (no push)
+# slurm-login-pods: Image & Gateway Suite Test (no push)
 # =============================================================================
-# Runs on every push to main (any path) and on dispatch:
-#   1. Secret + PII scan (`gateway/tests/scan_secrets_pii.py`) — this is a
-#      PUBLIC repo/image; key, credential, site IP/domain, or PII patterns fail
-#      the build. See SECRETS.md for what belongs at runtime instead.
-#   2. Shell/Python syntax checks + unit tests for the `gateway/` host suite
-#      (Port-22 Robot key filter, direct-gateway transfer classifier).
-#   3. Build the image with staged DEBs and smoke-test the userland:
-#      slurm clients, container-sshd-entrypoint, sshd, xauth, zero host keys,
-#      and login-shell environment scrubbing.
+# Runs on every branch push, pull request, and manual dispatch:
+#   1. Secret + PII scan (`tests/scan_secrets_pii.py`)
+#   2. Shellcheck / syntax checks + Python unittest + BATS tests
+#   3. Docker build of BOTH user (`images/user/Dockerfile`) and admin
+#      (`images/admin/Dockerfile`) images + smoke tests (no push to Docker Hub)
 # =============================================================================
-name: Test Login Image
+name: Test Login Images & Gateway
 
 on:
   workflow_dispatch:
@@ -21,41 +17,57 @@ on:
         required: false
         default: ''
   push:
-    branches:
-      - main
+  pull_request:
 
 concurrency:
-  group: test-${{ github.ref }}
+  group: test-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   secrets-and-unit-tests:
-    name: 🔍 Secrets/PII Scan & Gateway Unit Tests
+    name: 🔍 Secrets/PII Scan & Gateway Tests
     runs-on: ubuntu-24.04
     steps:
       - name: 🛠️ Checkout Repository
         uses: actions/checkout@v4
 
-      - name: 🔍 Scan for secrets, credentials, and PII
-        run: python3 gateway/tests/scan_secrets_pii.py
+      - name: 📦 Install bats & shellcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends bats shellcheck
 
-      - name: 🧪 Syntax-check shell & Python scripts
+      - name: 🔍 Scan for secrets, credentials, and PII
+        run: python3 tests/scan_secrets_pii.py
+
+      - name: 🧪 Syntax & ShellCheck validation
         run: |
           set -e
-          bash -n login-shell slurm-login-shell container-sshd-entrypoint
-          bash -n admin-pod/admin-login-shell admin-pod/admin-container-sshd-entrypoint
-          bash -n gateway/bin/*.sh gateway/bin/enter-login-job gateway/bin/sss_ssh_authorizedkeys.filter
-          bash -n gateway/sbin/loginbox-authorized-keys
-          bash -n gateway/provisioning/*.sh gateway/provisioning/ood-oidc-user-map
-          python3 -m py_compile gateway/bin/sss_ssh_authorizedkeys.filter.py \
-                                gateway/containerssh/loginbox-webhook.py \
-                                gateway/tests/*.py
+          bash -n images/user/login-shell images/user/slurm-login-shell images/user/container-sshd-entrypoint
+          bash -n images/user/bin/* images/user/profile.d/*.sh
+          bash -n images/admin/admin-login-shell images/admin/admin-container-sshd-entrypoint
+          bash -n login-gateway/libexec/* login-gateway/bin/enter-login-job
+          bash -n login-gateway/sbin/login-gateway-authorized-keys login-gateway/sbin/sss_ssh_authorizedkeys.filter
+          bash -n status/bin/cluster-status status/sbin/cluster-status-bake status/etc/profile.d/zz-cluster-status.sh
+          bash -n agent-guardrails/etc/claude-code/update-motd.sh agent-guardrails/etc/profile.d/ai-agent-skills.sh
+          bash -n deploy/warewulf/render-overlays.sh deploy/standalone/install.sh
+          shellcheck -S error \
+            images/user/login-shell images/user/container-sshd-entrypoint images/user/bin/* \
+            images/admin/admin-login-shell images/admin/admin-container-sshd-entrypoint \
+            login-gateway/libexec/dispatch login-gateway/libexec/route login-gateway/libexec/spawn \
+            login-gateway/libexec/stop login-gateway/libexec/classify-transfer \
+            login-gateway/sbin/login-gateway-authorized-keys login-gateway/sbin/sss_ssh_authorizedkeys.filter \
+            status/bin/cluster-status status/sbin/cluster-status-bake \
+            deploy/warewulf/render-overlays.sh deploy/standalone/install.sh
+          python3 -m py_compile login-gateway/sbin/sss_ssh_authorizedkeys.filter.py tests/*.py
 
-      - name: 🧪 Run gateway unit tests (Robot filter + Transfer classifier)
-        run: python3 -m unittest discover -v -s gateway/tests
+      - name: 🧪 Run Python unit tests
+        run: python3 -m unittest discover -v -s tests
+
+      - name: 🧪 Run BATS transfer fast-path tests
+        run: bats tests/transfer_fastpath.bats
 
   build-test:
-    name: 🐳 Build & Smoke Test
+    name: 🐳 Build & Smoke Test (User + Admin Images)
     runs-on: ubuntu-24.04
     needs: secrets-and-unit-tests
     timeout-minutes: 60
@@ -63,7 +75,7 @@ jobs:
       - name: 🛠️ Checkout Repository
         uses: actions/checkout@v4
 
-      - name: 🎯 Stage DEBs
+      - name: 🎯 Stage Slurm Client DEBs
         run: |
           set -e
           git clone --depth 1 https://github.com/ualberta-rcg/warewulf-slurmd /tmp/ww
@@ -80,15 +92,15 @@ jobs:
           cp /tmp/ww/slurm-debs/*_${VERSION}_*_u2404.deb debs/
           echo "version=$VERSION" >> $GITHUB_ENV
 
-      - name: 🐳 Build Image
+      - name: 🐳 Build User Image
         run: |
           set -o pipefail
-          docker build -t sel:test . 2>&1 | tee /tmp/build.log || {
-            echo "::error::build failed: $(grep -vE '^ #[0-9]+ \[|^ *[0-9]+ \||^>>>|^ ---$' /tmp/build.log | tail -n8 | tr '\n' ' ' | cut -c1-800)"
+          docker build -f images/user/Dockerfile --build-arg IMAGE_VERSION="${{ env.version }}" -t slp:user . 2>&1 | tee /tmp/build.log || {
+            echo "::error::user build failed: $(grep -vE '^ #[0-9]+ \[|^ *[0-9]+ \||^>>>|^ ---$' /tmp/build.log | tail -n8 | tr '\n' ' ' | cut -c1-800)"
             exit 1
           }
 
-      - name: 🧪 Smoke Tests
+      - name: 🧪 User Image Smoke Tests
         run: |
           set -e
           check() {
@@ -99,29 +111,30 @@ jobs:
               exit 1
             fi
           }
-          printf 'ClusterName=seltest\nSlurmctldHost=localhost(127.0.0.1)\nPlugStackConfig=/etc/slurm/plugstack.conf\n' > test-slurm.conf
+          printf 'ClusterName=slptest\nSlurmctldHost=localhost(127.0.0.1)\nPlugStackConfig=/etc/slurm/plugstack.conf\n' > test-slurm.conf
           CONFMNT="-v $PWD/test-slurm.conf:/etc/slurm/slurm.conf:ro"
-          check "srun --version"      docker run --rm $CONFMNT --entrypoint srun sel:test --version
-          check "sbatch --version"    docker run --rm $CONFMNT --entrypoint sbatch sel:test --version
-          check "scontrol version"    docker run --rm $CONFMNT --entrypoint scontrol sel:test version
-          check "login-shell present" docker run --rm --entrypoint test sel:test -x /usr/local/bin/login-shell
-          check "sshd-entry present"  docker run --rm --entrypoint test sel:test -x /usr/local/bin/container-sshd-entrypoint
-          check "sshd+xauth+sftp"     docker run --rm --entrypoint bash sel:test -lc 'command -v sshd >/dev/null && command -v xauth >/dev/null && test -x /usr/lib/openssh/sftp-server'
-          check "no baked hostkeys"   docker run --rm --entrypoint bash sel:test -c 'ls /etc/ssh/ssh_host_* >/dev/null 2>&1 && exit 1 || exit 0'
-          check "mpirun+module"       docker run --rm --entrypoint bash sel:test -lc 'command -v mpirun >/dev/null && command -v module >/dev/null && echo tools-ok'
-          check "no slurmd"           docker run --rm --entrypoint bash sel:test -c 'test ! -x /usr/sbin/slurmd && echo no-slurmd-ok'
-          check "no slurmctld"        docker run --rm --entrypoint bash sel:test -c 'test ! -x /usr/sbin/slurmctld && echo no-slurmctld-ok'
-          check "login-shell scrub"   docker run --rm -e SLURM_JOB_ID=12345 -e SLURM_CONF=/run/slurm/conf --entrypoint bash sel:test \
-            /usr/local/bin/login-shell -c 'test -z "${SLURM_JOB_ID:-}" && test "$SLURM_CONF" = "/run/slurm/conf/slurm.conf" && echo scrub-ok'
-          check "pyxis registered"    docker run --rm $CONFMNT --entrypoint bash sel:test -c 'srun --help 2>&1 | grep -c -- "--container" | grep -qv ^0'
-          check "claude installed"    docker run --rm --entrypoint bash sel:test -c 'command -v claude'
-          check "cvmfs client"        docker run --rm --entrypoint bash sel:test -c 'command -v cvmfs_config'
-          echo "✅ All smoke tests passed (Slurm ${{ env.version }})"
+          check "containment sentinel" docker run --rm --entrypoint test slp:user -s /etc/slurm-login-pods-release
+          check "srun --version"       docker run --rm $CONFMNT --entrypoint srun slp:user --version
+          check "sbatch --version"     docker run --rm $CONFMNT --entrypoint sbatch slp:user --version
+          check "scontrol version"     docker run --rm $CONFMNT --entrypoint scontrol slp:user version
+          check "login-shell present"  docker run --rm --entrypoint test slp:user -x /usr/local/bin/login-shell
+          check "sshd-entry present"   docker run --rm --entrypoint test slp:user -x /usr/local/bin/container-sshd-entrypoint
+          check "sftp-server symlink"  docker run --rm --entrypoint bash slp:user -c 'test -L /usr/libexec/openssh/sftp-server && test -x /usr/libexec/openssh/sftp-server'
+          check "sq + login-pod PATH"  docker run --rm --entrypoint bash slp:user -lc 'command -v sq && command -v login-pod && command -v seff && command -v diskusage_report'
+          check "cluster-status"       docker run --rm --entrypoint bash slp:user -lc 'cluster-status --plain --only header'
+          check "guardrails baked"     docker run --rm --entrypoint bash slp:user -c 'test -s /etc/claude-code/CLAUDE.md && test -s /etc/claude-code/managed-settings.json && test -d /etc/claude-code/.claude/skills/alliance-slurm && test -s /etc/agents/AGENTS.md'
+          check "no baked hostkeys"    docker run --rm --entrypoint bash slp:user -c 'ls /etc/ssh/ssh_host_* >/dev/null 2>&1 && exit 1 || exit 0'
+          check "no slurmd/slurmctld"  docker run --rm --entrypoint bash slp:user -c 'test ! -x /usr/sbin/slurmd && test ! -x /usr/sbin/slurmctld'
+          check "login-shell scrub"    docker run --rm -e SLURM_JOB_ID=12345 -e SLURM_CONF=/run/slurm/conf --entrypoint bash slp:user \
+            /usr/local/bin/login-shell -c 'test -z "${SLURM_JOB_ID:-}" && test "$LOGIN_POD_JOB_ID" = "12345" && test "$SLURM_CONF" = "/run/slurm/conf/slurm.conf"'
+          check "pyxis registered"     docker run --rm $CONFMNT --entrypoint bash slp:user -c 'srun --help 2>&1 | grep -c -- "--container" | grep -qv ^0'
+          check "claude + cvmfs"       docker run --rm --entrypoint bash slp:user -c 'command -v claude && command -v cvmfs_config'
+          echo "✅ All user image smoke tests passed (Slurm ${{ env.version }})"
 
       - name: 🐳 Build Admin Image
         run: |
           set -o pipefail
-          docker build -f admin-pod/Dockerfile -t sel:admin . 2>&1 | tee /tmp/admin-build.log || {
+          docker build -f images/admin/Dockerfile --build-arg IMAGE_VERSION="${{ env.version }}" -t slp:admin . 2>&1 | tee /tmp/admin-build.log || {
             echo "::error::admin build failed: $(grep -vE '^ #[0-9]+ \[|^ *[0-9]+ \||^>>>|^ ---$' /tmp/admin-build.log | tail -n8 | tr '\n' ' ' | cut -c1-800)"
             exit 1
           }
@@ -137,10 +150,12 @@ jobs:
               exit 1
             fi
           }
-          check "admin sshd entry"   docker run --rm --entrypoint test sel:admin -x /usr/local/bin/admin-container-sshd-entrypoint
-          check "admin login shell"   docker run --rm --entrypoint test sel:admin -x /usr/local/bin/admin-login-shell
-          check "sudo+su+sshd"        docker run --rm --entrypoint bash sel:admin -lc 'command -v sudo >/dev/null && command -v su >/dev/null && command -v sshd >/dev/null && command -v xauth >/dev/null'
-          check "pam_sss"             docker run --rm --entrypoint bash sel:admin -c 'find /lib /usr/lib -name pam_sss.so | grep -q pam_sss'
-          check "admin sudoers"       docker run --rm --entrypoint bash sel:admin -c 'test -f /etc/sudoers.d/gateway-admins && visudo -cf /etc/sudoers.d/gateway-admins'
-          check "no baked hostkeys"   docker run --rm --entrypoint bash sel:admin -c 'ls /etc/ssh/ssh_host_* >/dev/null 2>&1 && exit 1 || exit 0'
+          check "containment sentinel" docker run --rm --entrypoint test slp:admin -s /etc/slurm-login-pods-release
+          check "admin sshd entry"     docker run --rm --entrypoint test slp:admin -x /usr/local/bin/admin-container-sshd-entrypoint
+          check "admin login shell"    docker run --rm --entrypoint test slp:admin -x /usr/local/bin/admin-login-shell
+          check "sftp-server symlink"  docker run --rm --entrypoint bash slp:admin -c 'test -L /usr/libexec/openssh/sftp-server && test -x /usr/libexec/openssh/sftp-server'
+          check "sudo+su+sshd"         docker run --rm --entrypoint bash slp:admin -lc 'command -v sudo >/dev/null && command -v su >/dev/null && command -v sshd >/dev/null && command -v cluster-status >/dev/null'
+          check "pam_sss"              docker run --rm --entrypoint bash slp:admin -c 'find /lib /usr/lib -name pam_sss.so | grep -q pam_sss'
+          check "admin sudoers"        docker run --rm --entrypoint bash slp:admin -c 'test -f /etc/sudoers.d/gateway-admins && visudo -cf /etc/sudoers.d/gateway-admins'
+          check "no baked hostkeys"    docker run --rm --entrypoint bash slp:admin -c 'ls /etc/ssh/ssh_host_* >/dev/null 2>&1 && exit 1 || exit 0'
           echo "✅ Admin image smoke tests passed"
