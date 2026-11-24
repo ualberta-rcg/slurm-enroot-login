@@ -21,11 +21,12 @@ if [[ -n "${SLURM_JOB_ID:-}" && "$(cat /proc/1/comm 2>/dev/null || true)" == "sy
 fi
 
 export LOGIN_JOB_ID="${SLURM_JOB_ID:-${LOGIN_JOB_ID:-}}"
+export LOGIN_POD_JOB_ID="${LOGIN_JOB_ID}"
 
 KEEP_CONF="${SLURM_CONF:-}"
 for v in $(compgen -e); do
     case "$v" in
-        SLURM_*|SLURMD_*|PMI_*|PMIX_*|OMPI_*|I_MPI_*|HYDRA_*) unset "$v" ;;
+        SLURM_*|SLURMD_*|SBATCH_*|SRUN_*|SPANK_*|ENROOT_*|PMI_*|PMIX_*|OMPI_*|I_MPI_*|HYDRA_*) unset "$v" ;;
         MODULEPATH*|MODULERCFILE|MODULESHOME|LMOD_*|_LMOD*|MODULES_*|_ModuleTable*|__Init_Default_Modules) unset "$v" ;;
     esac
 done
