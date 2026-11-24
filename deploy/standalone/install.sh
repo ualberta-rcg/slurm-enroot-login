@@ -12,6 +12,7 @@
 #       [--root /] [--dry-run]
 # =============================================================================
 set -euo pipefail
+umask 0022
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 ROLE=""

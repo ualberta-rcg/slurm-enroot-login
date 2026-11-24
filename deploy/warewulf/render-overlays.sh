@@ -13,6 +13,7 @@
 #   deploy/warewulf/render-overlays.sh --output-dir /tmp/ww-overlays [--overlays list] [--dry-run]
 # =============================================================================
 set -euo pipefail
+umask 0022
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 OUTPUT_DIR=""
