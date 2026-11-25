@@ -7,15 +7,20 @@
   become: true
 
   vars:
-    codex_version: "0.149.0"
+    codex_version: "0.172.0"
     codex_url: "https://github.com/openai/codex/releases/download/rust-v{{ codex_version }}/codex-x86_64-unknown-linux-musl.tar.gz"
-    opencode_version: "1.18.21"
+    codex_sha256: "a2342a8f7f68f088be30620ccfe9cb84162c93a6b56177855961cda3ed6be392"
+    opencode_version: "2.4.1"
     opencode_url: "https://github.com/anomalyco/opencode/releases/download/v{{ opencode_version }}/opencode-linux-x64.tar.gz"
+    opencode_sha256: "9ddd18e3faf64eaeccf6a0fcbc96a5c7a14520ae5fd5b61e5be51d894f478b47"
+    gemini_cli_version: "0.71.1"
+    pi_coding_agent_version: "0.73.1"
 
   tasks:
     - name: Install apt prerequisites
       ansible.builtin.apt:
         name:
+          - ca-certificates
           - curl
           - gnupg
         state: present
@@ -29,6 +34,18 @@
         state: directory
         mode: "0755"
 
+    - name: Add NodeSource Node 22 LTS signing key
+      ansible.builtin.shell: |
+        curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor --yes -o /etc/apt/keyrings/nodesource.gpg
+      args:
+        creates: /etc/apt/keyrings/nodesource.gpg
+
+    - name: Add NodeSource Node 22 LTS apt repository
+      ansible.builtin.apt_repository:
+        repo: "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_22.x nodistro main"
+        filename: nodesource
+        state: present
+
     - name: Fetch the Claude Code signing key
       ansible.builtin.get_url:
         url: https://downloads.claude.ai/keys/claude-code.asc
@@ -41,17 +58,33 @@
         filename: claude-code
         state: present
 
-    - name: Install Claude Code
+    - name: Install Node.js 22 LTS and Claude Code
       ansible.builtin.apt:
-        name: claude-code
+        name:
+          - nodejs
+          - claude-code
         state: present
         update_cache: true
       environment:
         TMPDIR: /var/tmp
 
-    - name: Install Codex CLI
+    - name: Install Gemini CLI and Pi Coding Agent via npm
+      ansible.builtin.command:
+        cmd: "npm install -g --no-audit --no-fund @google/gemini-cli@{{ gemini_cli_version }} @mariozechner/pi-coding-agent@{{ pi_coding_agent_version }}"
+        creates: /usr/bin/gemini
+      environment:
+        TMPDIR: /var/tmp
+
+    - name: Download Codex CLI archive with sha256 verification
+      ansible.builtin.get_url:
+        url: "{{ codex_url }}"
+        dest: /var/tmp/codex.tar.gz
+        checksum: "sha256:{{ codex_sha256 }}"
+        mode: "0644"
+
+    - name: Extract Codex CLI
       ansible.builtin.unarchive:
-        src: "{{ codex_url }}"
+        src: /var/tmp/codex.tar.gz
         dest: /usr/local/bin
         remote_src: true
         mode: "0755"
@@ -63,24 +96,37 @@
         dest: /usr/local/bin/codex
         state: link
 
-    - name: Fetch the Antigravity CLI installer
+    - name: Download OpenCode CLI archive with sha256 verification
       ansible.builtin.get_url:
-        url: https://antigravity.google/cli/install.sh
-        dest: /var/tmp/agy-install.sh
-        mode: "0755"
+        url: "{{ opencode_url }}"
+        dest: /var/tmp/opencode.tar.gz
+        checksum: "sha256:{{ opencode_sha256 }}"
+        mode: "0644"
 
-    - name: Install Antigravity CLI
-      ansible.builtin.command:
-        cmd: /bin/bash /var/tmp/agy-install.sh -d /usr/local/bin
-        creates: /usr/local/bin/agy
-      environment:
-        TMPDIR: /var/tmp
-        HOME: /root
-
-    - name: Install OpenCode CLI
+    - name: Extract OpenCode CLI
       ansible.builtin.unarchive:
-        src: "{{ opencode_url }}"
+        src: /var/tmp/opencode.tar.gz
         dest: /usr/local/bin
         remote_src: true
         mode: "0755"
         creates: /usr/local/bin/opencode
+
+    - name: Install Antigravity CLI into /opt/antigravity
+      ansible.builtin.shell: |
+        mkdir -p /opt/antigravity/bin
+        curl -fsSL https://antigravity.google/cli/install.sh -o /var/tmp/agy-install.sh
+        HOME=/opt/antigravity /bin/bash /var/tmp/agy-install.sh -d /opt/antigravity/bin
+        chmod -R a+rX /opt/antigravity
+        ln -sf /opt/antigravity/bin/agy /usr/local/bin/agy
+      args:
+        creates: /usr/local/bin/agy
+
+    - name: Install Cursor CLI into /opt/cursor-agent
+      ansible.builtin.shell: |
+        mkdir -p /opt/cursor-agent
+        curl -fsSL https://cursor.com/install -o /var/tmp/cursor-install.sh
+        HOME=/opt/cursor-agent NO_COLOR=1 /bin/bash /var/tmp/cursor-install.sh
+        chmod -R a+rX /opt/cursor-agent
+        ln -sf /opt/cursor-agent/.local/bin/cursor-agent /usr/local/bin/cursor-agent
+      args:
+        creates: /usr/local/bin/cursor-agent

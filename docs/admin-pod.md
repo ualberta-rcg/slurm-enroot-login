@@ -12,6 +12,8 @@ When `ADMIN_POD_ENABLED="1"`, administrators instead land inside a dedicated **`
 | User namespace | Unprivileged userns | Host UID mapping (`root` is UID `0` inside pod) |
 | Filesystem mounts | Own `/home/<user>`, `/scratch/<user>`, member `/projects/<group>` | Full `/home`, `/scratch`, `/project(s)`, `/var/lib/sss/{pipes,mc}` |
 | `sudo` / `su` | Not installed / unprivileged | `sudo` (`NOPASSWD: ALL` for `GATEWAY_BYPASS_GROUPS`) + `libpam-sss` |
+| AI coding agents | All 7 CLIs + enforced HPC guardrails (`managed-settings.json`, `requirements.toml`, Gemini/Pi/Cursor/OpenCode policies) | All 7 CLIs + Alliance skills + `/etc/agents/site.md` with **zero command deny/ask restrictions** (`ADMIN_AGENT_GUARDRAILS="0"` default) |
+| Sysadmin toolset | Researcher/developer tools (`nmap` excluded) | Full K8s (`kubectl`, `helm`, `k9s`, `stern`), Ansible, `clush`, IPMI/BMC, NVMe/SMART, LDAP/SSSD/Munge, `nmap`/`tcpdump`/`nft`, DB clients, `tofu`, `aws`, `s5cmd`, `openstack`, `bpftrace`/`perf` |
 | Emergency fallback | `SLURM_DOWN_FALLBACK` (`restricted-shell` or `deny`) | Direct host shell on the gateway so operators are **never** locked out |
 
 ## Required Slurm Partition Settings

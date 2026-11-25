@@ -12,6 +12,7 @@ set -u
 PATH=/usr/local/bin:/usr/bin:/bin
 
 CONF="${CLUSTER_STATUS_CONF:-/etc/cluster-status/motd.conf}"
+# shellcheck disable=SC1090
 [ -r "$CONF" ] && . "$CONF"
 
 CACHE_DIR=${CLUSTER_STATUS_CACHE_DIR:-${CACHE_DIR:-/run/cluster-status}}

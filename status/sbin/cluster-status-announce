@@ -1,0 +1,184 @@
+#!/usr/bin/env bash
+# =============================================================================
+# cluster-status-announce — manage operator notices for cluster-status
+# =============================================================================
+# Subcommands:
+#   cluster-status-announce set    [--expires "YYYY-MM-DD HH:MM"] [--name SLUG] <msg | ->
+#   cluster-status-announce append [--expires "YYYY-MM-DD HH:MM"] [--name SLUG] <msg | ->
+#   cluster-status-announce clear  [--name SLUG]
+#   cluster-status-announce show
+#
+# Target path precedence:
+#   1. CLUSTER_STATUS_ANNOUNCE environment variable
+#   2. ANNOUNCE in /etc/cluster-status/motd.conf
+#   3. /etc/cluster-status/announce.txt
+#
+# Supports both single-file targets (announce.txt) and drop-in directories
+# (announce.d/*.txt). Mutating subcommands require root (UID 0) and write
+# atomically via mktemp + mv.
+# =============================================================================
+set -euo pipefail
+
+ENV_ANNOUNCE="${CLUSTER_STATUS_ANNOUNCE:-}"
+CONF="${CLUSTER_STATUS_CONF:-/etc/cluster-status/motd.conf}"
+ANNOUNCE=""
+if [[ -r "$CONF" ]]; then
+    # shellcheck disable=SC1090
+    source "$CONF"
+fi
+TARGET="${ENV_ANNOUNCE:-${ANNOUNCE:-/etc/cluster-status/announce.txt}}"
+
+usage() {
+    cat <<'EOF'
+Usage:
+  cluster-status-announce set    [--expires "YYYY-MM-DD HH:MM"] [--name SLUG] <message | ->
+  cluster-status-announce append [--expires "YYYY-MM-DD HH:MM"] [--name SLUG] <message | ->
+  cluster-status-announce clear  [--name SLUG]
+  cluster-status-announce show
+EOF
+}
+
+require_root() {
+    if [[ "$(id -u)" -ne 0 && "${CLUSTER_STATUS_ANNOUNCE_TEST_NONROOT:-0}" != "1" ]]; then
+        echo "ERROR: cluster-status-announce mutating commands must be run as root." >&2
+        exit 1
+    fi
+}
+
+is_dir_target() {
+    [[ -d "$TARGET" || "$TARGET" == *.d || "$TARGET" == */ ]]
+}
+
+validate_slug() {
+    local slug="$1"
+    if [[ -z "$slug" || ! "$slug" =~ ^[A-Za-z0-9._-]+$ ]]; then
+        echo "ERROR: invalid --name '${slug}' (use [A-Za-z0-9._-]+)." >&2
+        exit 2
+    fi
+}
+
+validate_expires() {
+    local exp="$1"
+    if ! date -d "$exp" +%s >/dev/null 2>&1; then
+        echo "ERROR: invalid --expires timestamp '${exp}' (expected 'YYYY-MM-DD HH:MM')." >&2
+        exit 2
+    fi
+}
+
+read_body() {
+    if [[ $# -eq 0 ]]; then
+        echo "ERROR: missing announcement message (pass text or '-' for stdin)." >&2
+        exit 2
+    fi
+    if [[ "$1" == "-" ]]; then
+        cat
+    else
+        printf '%s\n' "$*"
+    fi
+}
+
+atomic_write_file() {
+    local dest="$1" content="$2"
+    local parent tmp
+    parent=$(dirname "$dest")
+    mkdir -p "$parent"
+    tmp=$(mktemp "${parent}/.announce.XXXXXX")
+    chmod 0644 "$tmp"
+    printf '%s\n' "$content" > "$tmp"
+    mv -f "$tmp" "$dest"
+}
+
+SUBCMD="${1:-show}"
+shift || true
+
+case "$SUBCMD" in
+    -h|--help|help)
+        usage
+        exit 0
+        ;;
+    show)
+        CS_BIN="${CLUSTER_STATUS_BIN:-}"
+        if [[ -z "$CS_BIN" ]]; then
+            REPO_CS="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/bin/cluster-status"
+            if [[ -x "$REPO_CS" ]]; then
+                CS_BIN="$REPO_CS"
+            else
+                CS_BIN="/usr/local/bin/cluster-status"
+            fi
+        fi
+        exec "$CS_BIN" --plain --no-cache --only notice --announce "$TARGET"
+        ;;
+    set|append)
+        require_root
+        EXPIRES=""
+        SLUG=""
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --expires|-e) EXPIRES="${2:-}"; shift 2 ;;
+                --name|-n)    SLUG="${2:-}"; shift 2 ;;
+                --)           shift; break ;;
+                -*)           echo "ERROR: unknown option '$1'" >&2; exit 2 ;;
+                *)            break ;;
+            esac
+        done
+        [[ -n "$EXPIRES" ]] && validate_expires "$EXPIRES"
+        [[ -n "$SLUG" ]] && validate_slug "${SLUG%.txt}"
+        BODY=$(read_body "$@")
+        PAYLOAD="$BODY"
+        if [[ -n "$EXPIRES" ]]; then
+            PAYLOAD=$(printf 'expires: %s\n%s' "$EXPIRES" "$BODY")
+        fi
+
+        if is_dir_target; then
+            TARGET_DIR="${TARGET%/}"
+            mkdir -p "$TARGET_DIR"
+            chmod 0755 "$TARGET_DIR"
+            if [[ "$SUBCMD" == "set" && -z "$SLUG" ]]; then
+                rm -f "${TARGET_DIR}"/*.txt
+                SLUG="50-notice"
+            elif [[ -z "$SLUG" ]]; then
+                SLUG="$(date -u +%Y%m%d-%H%M%S)-notice"
+            fi
+            SLUG="${SLUG%.txt}"
+            atomic_write_file "${TARGET_DIR}/${SLUG}.txt" "$PAYLOAD"
+            echo "Wrote announcement: ${TARGET_DIR}/${SLUG}.txt"
+        else
+            if [[ "$SUBCMD" == "append" && -s "$TARGET" ]]; then
+                EXISTING=$(cat "$TARGET")
+                PAYLOAD=$(printf '%s\n\n%s' "$EXISTING" "$PAYLOAD")
+            fi
+            atomic_write_file "$TARGET" "$PAYLOAD"
+            echo "Wrote announcement: ${TARGET}"
+        fi
+        ;;
+    clear)
+        require_root
+        SLUG=""
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --name|-n) SLUG="${2:-}"; shift 2 ;;
+                *) echo "ERROR: unknown option '$1'" >&2; exit 2 ;;
+            esac
+        done
+        if is_dir_target; then
+            TARGET_DIR="${TARGET%/}"
+            if [[ -n "$SLUG" ]]; then
+                SLUG="${SLUG%.txt}"
+                validate_slug "$SLUG"
+                rm -f "${TARGET_DIR}/${SLUG}.txt"
+                echo "Cleared announcement: ${TARGET_DIR}/${SLUG}.txt"
+            elif [[ -d "$TARGET_DIR" ]]; then
+                rm -f "${TARGET_DIR}"/*.txt
+                echo "Cleared all announcements in ${TARGET_DIR}"
+            fi
+        else
+            atomic_write_file "$TARGET" ""
+            : > "$TARGET"
+            echo "Cleared announcement: ${TARGET}"
+        fi
+        ;;
+    *)
+        usage >&2
+        exit 2
+        ;;
+esac

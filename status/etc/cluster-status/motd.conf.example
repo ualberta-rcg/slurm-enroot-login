@@ -14,7 +14,10 @@
 # Optional custom links file ("Label:|https://example.org" per line)
 #LINKS_FILE=/etc/cluster-status/links.txt
 
-# Free-form notices file; rendered under "» Notice" when non-empty
+# Operator notices file OR drop-in directory (announce.d/*.txt); rendered under "» Notice".
+# Precedence: --announce PATH > CLUSTER_STATUS_ANNOUNCE env > ANNOUNCE here > default.
+# Each notice file may start with an optional "expires: YYYY-MM-DD HH:MM" first line;
+# manage live notices with `cluster-status-announce set|append|clear|show`.
 #ANNOUNCE=/etc/cluster-status/announce.txt
 
 # Partition hosting persistent login/robot/admin pods (excluded from batch counts)

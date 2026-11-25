@@ -18,8 +18,10 @@ Enroot + Pyxis + Slurm `cgroup/v2` provide **resource isolation, private mount/U
    - Site hooks (`/etc/login-gateway/hooks/*`) are executed by `route` **only** after verifying the hook file is owned by `0:0` (`root:root`) and not group/world-writable.
 5. **Containment Sentinel (`/etc/slurm-login-pods-release`):**
    If Pyxis/Enroot ever fails to enter the container namespace and falls through to host execution, `container-sshd-entrypoint` and `login-shell` detect the missing `/etc/slurm-login-pods-release` sentinel (and host mount namespace match) and immediately abort with exit code `78` instead of starting an uncontained `sshd` on the execution node.
-6. **Elimination of Internal SSH MITM/Spoofing:**
-   Each pod generates a fresh `ed25519` host key in private `/tmp/sshd` and publishes its SHA256 fingerprint to the Slurm job `Comment` (`<node>:<port>:<sha256>`). `route` pins that exact key before connecting, preventing port-squatting on shared execution hosts.
+6. **Elimination of Internal SSH MITM/Spoofing & Port Exposure:**
+   Each pod generates a fresh `ed25519` host key in private `/tmp/sshd`, enforces `GatewayPorts no` (keeping `AllowTcpForwarding yes` for VS Code / Cursor local tunnels while blocking wildcard remote listeners), and publishes its SHA256 fingerprint to the Slurm job `Comment` (`<node>:<port>:<sha256>`). `route` pins that exact key before connecting.
+7. **Gateway Transfer Mount-Namespace Sandbox & Structured Audit Trail:**
+   Gateway file transfers in `route` run inside a transient `systemd-run --pipe --wait --collect` unit with `ProtectSystem=strict`, `NoNewPrivileges=yes`, and `InaccessiblePaths` hiding `/opt`, `/etc/login-gateway`, `/root`, `/var/www`, `/etc/ood`, and `/etc/duo`. `dispatch` and `route` emit structured one-line `logger -t login-gateway` audit records (user, mode, target, client IP; never command arguments).
 
 ### Non-Goals / Optional Host Hardening
 

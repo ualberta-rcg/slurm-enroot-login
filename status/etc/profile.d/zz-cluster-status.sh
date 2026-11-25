@@ -1,6 +1,14 @@
 # /etc/profile.d/zz-cluster-status.sh — login status banner hook.
-# Silent during non-interactive sessions (scp/sftp/rsync), robot automation
-# pods, root shells, and when ~/.hushlogin or CLUSTER_STATUS_OFF=1 is set.
+# Exposes /etc/cluster-status/bin on PATH for ALL login shells (including
+# non-interactive agent tool calls), while keeping banner output strictly
+# interactive-only.
+
+if [ -d /etc/cluster-status/bin ]; then
+    case ":${PATH:-}:" in
+        *:/etc/cluster-status/bin:*) ;;
+        *) PATH="${PATH:+$PATH:}/etc/cluster-status/bin"; export PATH ;;
+    esac
+fi
 
 case $- in
     *i*) ;;

@@ -7,6 +7,12 @@
 
 export CC_CLUSTER="${CC_CLUSTER:-cluster}"
 
+# Login pod rootfs is read-only SquashFS: disable background CLI self-updaters
+if [ "${LOGIN_SESSION_MODE:-}" != "robot" ]; then
+    export DISABLE_AUTOUPDATER=1
+    export AGY_CLI_DISABLE_AUTO_UPDATE=true
+fi
+
 _slp_uid="$(id -u 2>/dev/null || echo 0)"
 _slp_user="$(id -un 2>/dev/null || echo "${USER:-}")"
 

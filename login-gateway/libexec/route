@@ -64,6 +64,7 @@ ROBOT_ENABLED="${ROBOT_ENABLED:-1}"
 ROBOT_MODE="${ROBOT_MODE:-dedicated}"
 ROBOT_GROUP="${ROBOT_GROUP:-mfa-automation-users}"
 TRANSFER_FASTPATH="${TRANSFER_FASTPATH:-1}"
+TRANSFER_SANDBOX="${TRANSFER_SANDBOX:-1}"
 XFER_SLICE="${XFER_SLICE:-login-gateway-xfer.slice}"
 XFER_MEM_HIGH="${XFER_MEM_HIGH:-256M}"
 XFER_MEM_MAX="${XFER_MEM_MAX:-512M}"
@@ -86,6 +87,14 @@ ORIG_TERM="${LOGIN_GATEWAY_ORIG_TERM:-${LOGINBOX_ORIG_TERM:-${TERM:-xterm-256col
 ORIG_SSH_CONNECTION="${LOGIN_GATEWAY_ORIG_SSH_CONNECTION:-${LOGINBOX_ORIG_SSH_CONNECTION:-}}"
 ORIG_SSH_ORIGINAL_COMMAND="${LOGIN_GATEWAY_ORIG_SSH_ORIGINAL_COMMAND:-${LOGINBOX_ORIG_SSH_ORIGINAL_COMMAND:-}}"
 ORIG_AUTH_TYPE="${LOGIN_GATEWAY_ORIG_AUTH_TYPE:-${LOGINBOX_ORIG_AUTH_TYPE:-}}"
+
+CLIENT_IP="${ORIG_SSH_CONNECTION%% *}"
+CLIENT_IP=$(printf '%s' "${CLIENT_IP:-local}" | tr -cd '0-9a-fA-F.:-')
+[[ -z "$CLIENT_IP" ]] && CLIENT_IP="local"
+
+audit_log() {
+    command -v logger >/dev/null 2>&1 && logger -t login-gateway -- "$*" 2>/dev/null || true
+}
 
 CLI_FORCE_CONTAINER="0"
 CLI_FORCE_ROBOT="0"
@@ -125,6 +134,7 @@ if [[ -z "$CALLER_USER" && -n "${SUDO_UID:-}" ]]; then
 fi
 
 TARGET_USER=""
+RESOLVED_VIA_SHIM="0"
 if [[ -z "$CALLER_USER" || "$CALLER_USER" == "root" ]]; then
     # Direct root invocation (e.g. root running enter-login-job <user>)
     if [[ $# -ge 1 && "${1:-}" != -* && "${1:-}" != "container" && "${1:-}" != "host" ]]; then
@@ -134,6 +144,7 @@ if [[ -z "$CALLER_USER" || "$CALLER_USER" == "root" ]]; then
         TARGET_USER="root"
     fi
 elif in_word_list "$CALLER_USER" "$SHIM_USERS"; then
+    RESOLVED_VIA_SHIM="1"
     IDENTITY_HOOK="${GATEWAY_DIR}/hooks/identity"
     if is_safe_root_hook "$IDENTITY_HOOK"; then
         TARGET_USER=$("$IDENTITY_HOOK" 2>/dev/null | head -n 1 || true)
@@ -249,11 +260,18 @@ if [[ "$ROBOT_MODE" == "port22" && "$ORIG_AUTH_TYPE" == "publickey" ]] && ! is_i
 fi
 
 if [[ "$SESSION_MODE" == "robot" ]]; then
+    if [[ "$RESOLVED_VIA_SHIM" == "1" ]]; then
+        audit_log "event=deny reason=robot_shim_unsupported user=${TARGET_USER} caller=${CALLER_USER:-root} mode=robot ip=${CLIENT_IP}"
+        echo "ERROR: robot SSH automation requires native SSSD/LDAP (CCDB) user resolution and is not supported for OIDC/CILogon shim accounts ('${CALLER_USER}')." >&2
+        exit 1
+    fi
     if [[ "$ROBOT_ENABLED" != "1" ]]; then
+        audit_log "event=deny reason=robot_disabled user=${TARGET_USER} caller=${CALLER_USER:-root} mode=robot ip=${CLIENT_IP}"
         echo "ERROR: robot SSH automation is disabled on this gateway." >&2
         exit 1
     fi
     if ! user_in_group_list "$ROBOT_GROUP"; then
+        audit_log "event=deny reason=robot_group_unauthorized user=${TARGET_USER} caller=${CALLER_USER:-root} mode=robot ip=${CLIENT_IP}"
         echo "ERROR: user ${TARGET_USER} is not authorized for robot SSH access (${ROBOT_GROUP})." >&2
         exit 1
     fi
@@ -265,9 +283,10 @@ fi
 # ── 2. Direct Gateway File Transfer Fast-Path (0 Slurm jobs) ─────────────────
 if [[ "$TRANSFER_FASTPATH" == "1" && $# -ge 2 && "${1:-}" == "-c" ]]; then
     if classify_transfer_cmd "$2" "$ORIG_SSH_ORIGINAL_COMMAND"; then
+        audit_log "event=transfer_fastpath user=${TARGET_USER} caller=${CALLER_USER:-root} mode=${SESSION_MODE} target=gateway ip=${CLIENT_IP}"
         run_optional_hook provision "$TARGET_USER" "transfer"
         ls -d "${USER_HOME}/." >/dev/null 2>&1 || true
-        cd "$USER_HOME" 2>/dev/null || cd /tmp
+        cd "$USER_HOME" 2>/dev/null || cd /tmp || exit 1
 
         XFER_ENV=(
             HOME="$USER_HOME"
@@ -284,15 +303,33 @@ if [[ "$TRANSFER_FASTPATH" == "1" && $# -ge 2 && "${1:-}" == "-c" ]]; then
         fi
 
         if [[ -S /run/systemd/private ]] && command -v systemd-run >/dev/null 2>&1; then
-            exec systemd-run --quiet --scope \
-                --slice="$XFER_SLICE" \
-                --property="MemoryHigh=${XFER_MEM_HIGH}" \
-                --property="MemoryMax=${XFER_MEM_MAX}" \
-                --property="CPUQuota=${XFER_CPU_QUOTA}" \
-                --property="TasksMax=${XFER_TASKS_MAX}" \
-                env -i "${XFER_ENV[@]}" \
-                setpriv --reuid="$USER_UID" --regid="$USER_GID" --init-groups \
-                /bin/bash -c "$NORMALIZED_XFER_CMD"
+            if [[ "$TRANSFER_SANDBOX" == "1" ]]; then
+                USER_HOME_PARENT=$(dirname "$USER_HOME")
+                exec systemd-run --quiet --pipe --wait --collect \
+                    --slice="$XFER_SLICE" \
+                    --working-directory="$USER_HOME" \
+                    --property="MemoryHigh=${XFER_MEM_HIGH}" \
+                    --property="MemoryMax=${XFER_MEM_MAX}" \
+                    --property="CPUQuota=${XFER_CPU_QUOTA}" \
+                    --property="TasksMax=${XFER_TASKS_MAX}" \
+                    --property="NoNewPrivileges=yes" \
+                    --property="ProtectSystem=strict" \
+                    --property="ReadWritePaths=-/home -/scratch -/projects -/project -/tmp -/var/tmp -${USER_HOME_PARENT}" \
+                    --property="InaccessiblePaths=-/opt -/etc/login-gateway -/etc/loginbox -/root -/var/www -/etc/ood -/etc/duo" \
+                    env -i "${XFER_ENV[@]}" \
+                    setpriv --reuid="$USER_UID" --regid="$USER_GID" --init-groups \
+                    /bin/bash -c "$NORMALIZED_XFER_CMD"
+            else
+                exec systemd-run --quiet --scope \
+                    --slice="$XFER_SLICE" \
+                    --property="MemoryHigh=${XFER_MEM_HIGH}" \
+                    --property="MemoryMax=${XFER_MEM_MAX}" \
+                    --property="CPUQuota=${XFER_CPU_QUOTA}" \
+                    --property="TasksMax=${XFER_TASKS_MAX}" \
+                    env -i "${XFER_ENV[@]}" \
+                    setpriv --reuid="$USER_UID" --regid="$USER_GID" --init-groups \
+                    /bin/bash -c "$NORMALIZED_XFER_CMD"
+            fi
         else
             exec env -i "${XFER_ENV[@]}" \
                 setpriv --reuid="$USER_UID" --regid="$USER_GID" --init-groups \
@@ -392,7 +429,7 @@ enter_gateway_host() {
         fi
     fi
 
-    cd "$USER_HOME" 2>/dev/null || cd /tmp
+    cd "$USER_HOME" 2>/dev/null || cd /tmp || exit 1
     local runner=()
     if [[ "$capped" == "1" && -S /run/systemd/private ]] && command -v systemd-run >/dev/null 2>&1; then
         runner=(
@@ -616,6 +653,7 @@ attach_routed_session() {
         rm -f "$ROUTE_FILE" 2>/dev/null || true
     fi
 
+    # shellcheck disable=SC2034
     JID=""
     CNODE=""
     CPORT=""
@@ -647,11 +685,13 @@ fi
 
 if want_admin_pod; then
     SESSION_MODE="admin"
+    audit_log "event=session_route user=${TARGET_USER} caller=${CALLER_USER:-root} mode=admin target=pod ip=${CLIENT_IP}"
     apply_session_route
     maybe_print_motd "$@"
     attach_routed_session "$@"
     rc=$?
     if [[ "$SPAWN_FAILED" == "1" || "$rc" -eq 255 ]]; then
+        audit_log "event=session_fallback user=${TARGET_USER} caller=${CALLER_USER:-root} mode=admin target=host ip=${CLIENT_IP}"
         echo "Admin root pod unavailable; falling back to the gateway host shell." >&2
         SESSION_MODE="login"
         enter_gateway_host 0 "$@"
@@ -660,15 +700,18 @@ if want_admin_pod; then
 fi
 
 if [[ "$SESSION_MODE" == "login" && "$FORCE_CONTAINER" != "1" ]] && user_in_group_list "$GATEWAY_BYPASS_GROUPS"; then
+    audit_log "event=session_route user=${TARGET_USER} caller=${CALLER_USER:-root} mode=login target=host ip=${CLIENT_IP}"
     enter_gateway_host 0 "$@"
 fi
 
+audit_log "event=session_route user=${TARGET_USER} caller=${CALLER_USER:-root} mode=${SESSION_MODE} target=pod ip=${CLIENT_IP}"
 apply_session_route
 maybe_print_motd "$@"
 attach_routed_session "$@"
 rc=$?
 if [[ "$SPAWN_FAILED" == "1" ]]; then
     if [[ "$SESSION_MODE" == "login" && "$SLURM_DOWN_FALLBACK" == "restricted-shell" ]] && ! slurm_controller_reachable; then
+        audit_log "event=session_fallback user=${TARGET_USER} caller=${CALLER_USER:-root} mode=login target=rescue ip=${CLIENT_IP}"
         echo "WARNING: Slurm controller is temporarily unreachable; opening a resource-capped rescue shell on the login gateway." >&2
         enter_gateway_host 1 "$@"
     fi

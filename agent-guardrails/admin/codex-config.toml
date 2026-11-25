@@ -1,0 +1,2 @@
+# System-wide defaults for Codex CLI inside unrestricted admin pods.
+check_for_update_on_startup = false

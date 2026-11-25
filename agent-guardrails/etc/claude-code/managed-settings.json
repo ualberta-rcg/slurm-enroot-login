@@ -1,6 +1,5 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-settings.json",
-  "autoUpdatesChannel": "latest",
   "permissions": {
     "disableBypassPermissionsMode": "disable",
     "allow": [
@@ -70,12 +69,13 @@
     ]
   },
   "env": {
+    "DISABLE_AUTOUPDATER": "1",
     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
     "DISABLE_ERROR_REPORTING": "1",
     "DISABLE_BUG_COMMAND": "1"
   },
   "cleanupPeriodDays": 14,
   "companyAnnouncements": [
-    "\u001b[1m\u001b[36mALLIANCE HPC\u001b[0m  \u001b[2mClaude Code \u00b7 Login Pod Guardrails \u00b7 Digital Research Alliance of Canada\u001b[0m\n\n\u001b[1m\u001b[33mYou are inside a shared cluster login pod, not a personal workstation.\u001b[0m Site-managed settings, skills, and guardrails are active here. Everything the agent runs executes under your account and remains your responsibility.\n\n\u001b[1m\u001b[33mWhat we expect of you:\u001b[0m\n\u001b[1mReview every command\u001b[0m the agent proposes before approving it.\n\u001b[1mKeep compute out of the login pod.\u001b[0m Submit heavy work through Slurm (sbatch/salloc), never inside the login pod, and never run agents on robot.* automation nodes.\n\u001b[1mProtect your data.\u001b[0m Prompts, files, and command output may leave the cluster to the AI provider. Keep credentials, PII, and restricted or unpublished research data out unless authorized.\n\u001b[1mRespect other users.\u001b[0m Stay out of other users' /home, /scratch, and /project directories. Do not enumerate accounts.\n\u001b[1mMind your storage.\u001b[0m Job I/O belongs on $SCRATCH, not $HOME.\n\n\u001b[2mDocs: docs.alliancecan.ca \u00b7 Support: support@tech.alliancecan.ca\u001b[0m\n\n\u001b[3m\u001b[35mI'm sorry Dave, I'm afraid I can't do that.\u001b[0m"
+    "\u001b[1m\u001b[36mALLIANCE HPC\u001b[0m  \u001b[2mClaude Code \u00b7 Login Pod Guardrails \u00b7 Digital Research Alliance of Canada\u001b[0m\n\n\u001b[1m\u001b[33mYou are inside a shared cluster login pod, not a personal workstation.\u001b[0m Site-managed settings, skills, and guardrails are active here. Everything the agent runs executes under your account and remains your responsibility. Run \u001b[1mcluster-status\u001b[0m for live cluster status.\n\n\u001b[1m\u001b[33mWhat we expect of you:\u001b[0m\n\u001b[1mReview every command\u001b[0m the agent proposes before approving it.\n\u001b[1mKeep compute out of the login pod.\u001b[0m Submit heavy work through Slurm (sbatch/salloc), never inside the login pod, and never run agents on robot.* automation nodes.\n\u001b[1mProtect your data.\u001b[0m Prompts, files, and command output may leave the cluster to the AI provider. Keep credentials, PII, and restricted or unpublished research data out unless authorized.\n\u001b[1mRespect other users.\u001b[0m Stay out of other users' /home, /scratch, and /project directories. Do not enumerate accounts.\n\u001b[1mMind your storage.\u001b[0m Job I/O belongs on $SCRATCH, not $HOME.\n\n\u001b[2mDocs: docs.alliancecan.ca \u00b7 Support: support@tech.alliancecan.ca\u001b[0m\n\n\u001b[3m\u001b[35mI'm sorry Dave, I'm afraid I can't do that.\u001b[0m"
   ]
 }

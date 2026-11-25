@@ -62,7 +62,11 @@ if [[ ! -d "$GATEWAY_DIR" && -d /etc/loginbox ]]; then
     GATEWAY_DIR="/etc/loginbox"
 fi
 STATUS_ENABLED="${STATUS_ENABLED:-1}"
+STATUS_ANNOUNCE_PATH="${STATUS_ANNOUNCE_PATH:-}"
 AGENT_GUARDRAILS_ENABLED="${AGENT_GUARDRAILS_ENABLED:-1}"
+ADMIN_AGENT_GUARDRAILS="${ADMIN_AGENT_GUARDRAILS:-0}"
+POD_OVERSUBSCRIBE="${POD_OVERSUBSCRIBE:-1}"
+PREFER_LOCAL_NODE="${PREFER_LOCAL_NODE:-1}"
 POD_HOSTNAME_TEMPLATE="${POD_HOSTNAME_TEMPLATE-%c-%m-%u}"
 
 if [[ "$MODE" == "robot" ]]; then
@@ -214,7 +218,7 @@ if [[ -n "$existing" ]]; then
     if try_reuse_running_job "$existing"; then
         exit 0
     fi
-    IFS="|" read -r existing_jid existing_state existing_node existing_comment <<< "$existing"
+    IFS="|" read -r _existing_jid existing_state existing_node existing_comment <<< "$existing"
     if [[ -z "$TARGET_NODE" || -z "$existing_node" || "$existing_node" == "$TARGET_NODE" ]]; then
         if [[ "$existing_state" == "PD" || ( "$existing_state" == "R" && -z "$existing_comment" ) ]]; then
             for _ in $(seq 1 40); do
@@ -255,6 +259,11 @@ if [[ -z "$PART_SUMMARY" ]]; then
 fi
 
 # 3. Build container bind mounts
+EFFECTIVE_ANNOUNCE_PATH=""
+if [[ -n "$STATUS_ANNOUNCE_PATH" && "$MODE" != "robot" && -e "$STATUS_ANNOUNCE_PATH" ]]; then
+    EFFECTIVE_ANNOUNCE_PATH="${STATUS_ANNOUNCE_PATH%/}"
+fi
+
 build_mounts() {
     local m
     if [[ "$MODE" == "admin" ]]; then
@@ -264,8 +273,9 @@ build_mounts() {
         [[ -d /project ]] && m+=",/project"
         m+=",${GATEWAY_DIR}:/etc/login-gateway:ro,${GATEWAY_DIR}:/etc/loginbox:ro"
         [[ -d /etc/cluster-status ]] && m+=",/etc/cluster-status:/etc/cluster-status:ro"
-        [[ -d /etc/claude-code && "$AGENT_GUARDRAILS_ENABLED" == "1" ]] && m+=",/etc/claude-code:/etc/claude-code:ro"
-        [[ -f /etc/agents/site.md && "$AGENT_GUARDRAILS_ENABLED" == "1" ]] && m+=",/etc/agents/site.md:/etc/agents/site.md:ro"
+        [[ -n "$EFFECTIVE_ANNOUNCE_PATH" ]] && m+=",${EFFECTIVE_ANNOUNCE_PATH}:${EFFECTIVE_ANNOUNCE_PATH}:ro"
+        [[ -d /etc/claude-code && "$ADMIN_AGENT_GUARDRAILS" == "1" ]] && m+=",/etc/claude-code:/etc/claude-code:ro"
+        [[ -f /etc/agents/site.md ]] && m+=",/etc/agents/site.md:/etc/agents/site.md:ro"
         [[ -d /var/lib/sss/pipes ]] && m+=",/var/lib/sss/pipes"
         [[ -d /var/lib/sss/mc ]] && m+=",/var/lib/sss/mc:/var/lib/sss/mc:ro"
         echo "$m"
@@ -284,15 +294,66 @@ build_mounts() {
     done
     if [[ "$MODE" != "robot" ]]; then
         [[ -d /etc/cluster-status ]] && m+=",/etc/cluster-status:/etc/cluster-status:ro"
+        [[ -n "$EFFECTIVE_ANNOUNCE_PATH" ]] && m+=",${EFFECTIVE_ANNOUNCE_PATH}:${EFFECTIVE_ANNOUNCE_PATH}:ro"
         [[ -d /etc/claude-code && "$AGENT_GUARDRAILS_ENABLED" == "1" ]] && m+=",/etc/claude-code:/etc/claude-code:ro"
         [[ -f /etc/agents/site.md && "$AGENT_GUARDRAILS_ENABLED" == "1" ]] && m+=",/etc/agents/site.md:/etc/agents/site.md:ro"
     fi
     echo "$m"
 }
 
+mem_to_mb() {
+    local val="$1"
+    case "$val" in
+        *[Gg]) echo $(( ${val%[Gg]} * 1024 )) ;;
+        *[Mm]) echo $(( ${val%[Mm]} )) ;;
+        *[Tt]) echo $(( ${val%[Tt]} * 1048576 )) ;;
+        *[0-9]) echo $(( val )) ;;
+        *) echo 4096 ;;
+    esac
+}
+
+local_node_has_capacity() {
+    local lhost="$1" req_mb="$2" line
+    [[ -n "$lhost" ]] || return 1
+    line=$(scontrol -o show node "$lhost" 2>/dev/null || true)
+    [[ -n "$line" ]] || return 1
+    awk -v part="$PARTITION" -v req="$req_mb" '
+        {
+            in_part = 0; rm = 0; am = 0; spec = 0; st = ""
+            for (i = 1; i <= NF; i++) {
+                if ($i ~ /^Partitions=/) {
+                    split($i, a, "="); n = split(a[2], p, ",")
+                    for (j = 1; j <= n; j++) if (p[j] == part) in_part = 1
+                }
+                if ($i ~ /^State=/)        { split($i, a, "="); st = tolower(a[2]) }
+                if ($i ~ /^RealMemory=/)   { split($i, a, "="); rm = a[2] + 0 }
+                if ($i ~ /^AllocMem=/)     { split($i, a, "="); am = a[2] + 0 }
+                if ($i ~ /^MemSpecLimit=/) { split($i, a, "="); spec = a[2] + 0 }
+            }
+            if (!in_part) exit 1
+            if (st ~ /(down|drain|drng|maint|unk|fail)/) exit 1
+            if ((rm - spec - am) < req) exit 1
+            exit 0
+        }
+    ' <<< "$line"
+}
+
 MOUNTS=$(build_mounts)
 NODE_ARG=""
-[[ -n "$TARGET_NODE" ]] && NODE_ARG="-w ${TARGET_NODE}"
+if [[ -n "$TARGET_NODE" ]]; then
+    NODE_ARG="-w ${TARGET_NODE}"
+elif [[ "$PREFER_LOCAL_NODE" == "1" ]]; then
+    LOCAL_HOST=$(hostname -s 2>/dev/null || true)
+    REQ_MEM_MB=$(mem_to_mb "$MEM")
+    if local_node_has_capacity "$LOCAL_HOST" "$REQ_MEM_MB"; then
+        NODE_ARG="-w ${LOCAL_HOST}"
+    fi
+fi
+
+SALLOC_EXTRA_FLAGS=""
+if [[ "$POD_OVERSUBSCRIBE" == "1" && "$MODE" != "admin" ]]; then
+    SALLOC_EXTRA_FLAGS="--oversubscribe"
+fi
 
 UNSHARE_ARG=""
 if [[ -n "$POD_HOSTNAME" ]] && /usr/bin/srun --help 2>&1 | grep -q -- '--container-unshare'; then
@@ -317,6 +378,18 @@ else
     done
 fi
 
+if [[ "$MODE" != "admin" && "$(id -u)" -eq 0 && -n "$USER_UID" ]]; then
+    HOSTNAME_DIR="${STATE_BASE}/pod-hostname"
+    mkdir -p "$HOSTNAME_DIR" && chmod 755 "$HOSTNAME_DIR"
+    if [[ -n "$POD_HOSTNAME" ]]; then
+        printf '%s\n' "$POD_HOSTNAME" > "${HOSTNAME_DIR}/${USER_UID}.tmp"
+        chmod 644 "${HOSTNAME_DIR}/${USER_UID}.tmp"
+        mv -f "${HOSTNAME_DIR}/${USER_UID}.tmp" "${HOSTNAME_DIR}/${USER_UID}"
+    else
+        rm -f "${HOSTNAME_DIR}/${USER_UID}"
+    fi
+fi
+
 rm -f "$LOG_FILE" 2>/dev/null || true
 touch "$LOG_FILE"
 chmod 600 "$LOG_FILE"
@@ -327,13 +400,13 @@ if [[ "$MODE" == "admin" && "$(id -u)" -ne 0 ]]; then
     exit 1
 fi
 
-COMMON_ENV_NAMES="LOGIN_GATEWAY_SESSION_MODE,LOGINBOX_SESSION_MODE,LOGIN_GATEWAY_POD_HOSTNAME,LOGIN_GATEWAY_CLUSTER_NAME,LOGIN_GATEWAY_STATUS_ENABLED,LOGIN_GATEWAY_GUARDRAILS_ENABLED"
+COMMON_ENV_NAMES="LOGIN_GATEWAY_SESSION_MODE,LOGINBOX_SESSION_MODE,LOGIN_GATEWAY_POD_HOSTNAME,LOGIN_GATEWAY_CLUSTER_NAME,LOGIN_GATEWAY_STATUS_ENABLED,LOGIN_GATEWAY_GUARDRAILS_ENABLED,LOGIN_GATEWAY_ANNOUNCE_PATH"
 
 if [[ "$(id -u)" -eq 0 && "$MODE" == "admin" ]]; then
     SRUN_ADMIN_FLAGS="--container-writable --no-container-mount-home ${UNSHARE_ARG} --container-env=ENROOT_ALLOW_SUPERUSER,${COMMON_ENV_NAMES},LOGINBOX_ADMIN_USER,LOGINBOX_ADMIN_UID,LOGINBOX_ADMIN_GID,LOGINBOX_ADMIN_HOME,LOGINBOX_ADMIN_SHELL"
     systemctl stop "${UNIT_NAME}.service" 2>/dev/null || true
     systemctl reset-failed "${UNIT_NAME}.service" 2>/dev/null || true
-    systemd-run --quiet \
+    systemd-run --quiet --collect \
         --unit="$UNIT_NAME" \
         --slice=system.slice \
         --working-directory=/tmp \
@@ -346,19 +419,20 @@ if [[ "$(id -u)" -eq 0 && "$MODE" == "admin" ]]; then
         --setenv="LOGIN_GATEWAY_POD_HOSTNAME=${POD_HOSTNAME}" \
         --setenv="LOGIN_GATEWAY_CLUSTER_NAME=${CLUSTER_NAME}" \
         --setenv="LOGIN_GATEWAY_STATUS_ENABLED=${STATUS_ENABLED}" \
-        --setenv="LOGIN_GATEWAY_GUARDRAILS_ENABLED=${AGENT_GUARDRAILS_ENABLED}" \
+        --setenv="LOGIN_GATEWAY_GUARDRAILS_ENABLED=${ADMIN_AGENT_GUARDRAILS}" \
+        --setenv="LOGIN_GATEWAY_ANNOUNCE_PATH=${EFFECTIVE_ANNOUNCE_PATH}" \
         --setenv="LOGINBOX_ADMIN_USER=${TARGET_USER}" \
         --setenv="LOGINBOX_ADMIN_UID=${USER_UID}" \
         --setenv="LOGINBOX_ADMIN_GID=${USER_GID}" \
         --setenv="LOGINBOX_ADMIN_HOME=${USER_HOME}" \
         --setenv="LOGINBOX_ADMIN_SHELL=${USER_SHELL}" \
         --property="KillMode=control-group" \
-        /bin/bash -c "export ENROOT_ALLOW_SUPERUSER=yes LOGIN_GATEWAY_SESSION_MODE=admin LOGINBOX_SESSION_MODE=admin LOGIN_GATEWAY_POD_HOSTNAME=${POD_HOSTNAME@Q} LOGIN_GATEWAY_CLUSTER_NAME=${CLUSTER_NAME@Q} LOGIN_GATEWAY_STATUS_ENABLED=${STATUS_ENABLED@Q} LOGIN_GATEWAY_GUARDRAILS_ENABLED=${AGENT_GUARDRAILS_ENABLED@Q} LOGINBOX_ADMIN_USER=${TARGET_USER} LOGINBOX_ADMIN_UID=${USER_UID} LOGINBOX_ADMIN_GID=${USER_GID} LOGINBOX_ADMIN_HOME=${USER_HOME@Q} LOGINBOX_ADMIN_SHELL=${USER_SHELL@Q}; exec /usr/bin/salloc -p ${PARTITION} -J ${JOB_NAME} --cpus-per-task=${CPUS} --mem=${MEM} -t ${WALLTIME} ${NODE_ARG} /usr/bin/srun --overlap --export=ALL --container-image=${IMAGE} --container-mounts=${MOUNTS} ${SRUN_ADMIN_FLAGS} ${ENTRYPOINT_CMD} </dev/null >>${LOG_FILE} 2>&1"
+        /bin/bash -c "export ENROOT_ALLOW_SUPERUSER=yes LOGIN_GATEWAY_SESSION_MODE=admin LOGINBOX_SESSION_MODE=admin LOGIN_GATEWAY_POD_HOSTNAME=${POD_HOSTNAME@Q} LOGIN_GATEWAY_CLUSTER_NAME=${CLUSTER_NAME@Q} LOGIN_GATEWAY_STATUS_ENABLED=${STATUS_ENABLED@Q} LOGIN_GATEWAY_GUARDRAILS_ENABLED=${ADMIN_AGENT_GUARDRAILS@Q} LOGIN_GATEWAY_ANNOUNCE_PATH=${EFFECTIVE_ANNOUNCE_PATH@Q} LOGINBOX_ADMIN_USER=${TARGET_USER} LOGINBOX_ADMIN_UID=${USER_UID} LOGINBOX_ADMIN_GID=${USER_GID} LOGINBOX_ADMIN_HOME=${USER_HOME@Q} LOGINBOX_ADMIN_SHELL=${USER_SHELL@Q}; exec /usr/bin/salloc -p ${PARTITION} -J ${JOB_NAME} --cpus-per-task=${CPUS} --mem=${MEM} -t ${WALLTIME} ${SALLOC_EXTRA_FLAGS} ${NODE_ARG} /usr/bin/srun --overlap --export=ALL --container-image=${IMAGE} --container-mounts=${MOUNTS} ${SRUN_ADMIN_FLAGS} ${ENTRYPOINT_CMD} </dev/null >>${LOG_FILE} 2>&1"
 elif [[ "$(id -u)" -eq 0 ]]; then
     SRUN_USER_FLAGS="${UNSHARE_ARG} --container-env=${COMMON_ENV_NAMES}"
     systemctl stop "${UNIT_NAME}.service" 2>/dev/null || true
     systemctl reset-failed "${UNIT_NAME}.service" 2>/dev/null || true
-    systemd-run --quiet \
+    systemd-run --quiet --collect \
         --unit="$UNIT_NAME" \
         --slice=system.slice \
         --uid="$TARGET_USER" \
@@ -373,14 +447,17 @@ elif [[ "$(id -u)" -eq 0 ]]; then
         --setenv="LOGIN_GATEWAY_CLUSTER_NAME=${CLUSTER_NAME}" \
         --setenv="LOGIN_GATEWAY_STATUS_ENABLED=${STATUS_ENABLED}" \
         --setenv="LOGIN_GATEWAY_GUARDRAILS_ENABLED=${AGENT_GUARDRAILS_ENABLED}" \
+        --setenv="LOGIN_GATEWAY_ANNOUNCE_PATH=${EFFECTIVE_ANNOUNCE_PATH}" \
         --property="KillMode=control-group" \
-        /bin/bash -c "export LOGIN_GATEWAY_SESSION_MODE=${MODE@Q} LOGINBOX_SESSION_MODE=${MODE@Q} LOGIN_GATEWAY_POD_HOSTNAME=${POD_HOSTNAME@Q} LOGIN_GATEWAY_CLUSTER_NAME=${CLUSTER_NAME@Q} LOGIN_GATEWAY_STATUS_ENABLED=${STATUS_ENABLED@Q} LOGIN_GATEWAY_GUARDRAILS_ENABLED=${AGENT_GUARDRAILS_ENABLED@Q}; exec /usr/bin/salloc -p ${PARTITION} -J ${JOB_NAME} --cpus-per-task=${CPUS} --mem=${MEM} -t ${WALLTIME} ${NODE_ARG} /usr/bin/srun --overlap --export=ALL --container-image=${IMAGE} --container-mounts=${MOUNTS} ${SRUN_USER_FLAGS} ${ENTRYPOINT_CMD} </dev/null >>${LOG_FILE} 2>&1"
+        /bin/bash -c "export LOGIN_GATEWAY_SESSION_MODE=${MODE@Q} LOGINBOX_SESSION_MODE=${MODE@Q} LOGIN_GATEWAY_POD_HOSTNAME=${POD_HOSTNAME@Q} LOGIN_GATEWAY_CLUSTER_NAME=${CLUSTER_NAME@Q} LOGIN_GATEWAY_STATUS_ENABLED=${STATUS_ENABLED@Q} LOGIN_GATEWAY_GUARDRAILS_ENABLED=${AGENT_GUARDRAILS_ENABLED@Q} LOGIN_GATEWAY_ANNOUNCE_PATH=${EFFECTIVE_ANNOUNCE_PATH@Q}; exec /usr/bin/salloc -p ${PARTITION} -J ${JOB_NAME} --cpus-per-task=${CPUS} --mem=${MEM} -t ${WALLTIME} ${SALLOC_EXTRA_FLAGS} ${NODE_ARG} /usr/bin/srun --overlap --export=ALL --container-image=${IMAGE} --container-mounts=${MOUNTS} ${SRUN_USER_FLAGS} ${ENTRYPOINT_CMD} </dev/null >>${LOG_FILE} 2>&1"
 else
     cd /tmp
+    # shellcheck disable=SC2086
     LOGIN_GATEWAY_SESSION_MODE="${MODE}" LOGINBOX_SESSION_MODE="${MODE}" \
         LOGIN_GATEWAY_POD_HOSTNAME="${POD_HOSTNAME}" LOGIN_GATEWAY_CLUSTER_NAME="${CLUSTER_NAME}" \
         LOGIN_GATEWAY_STATUS_ENABLED="${STATUS_ENABLED}" LOGIN_GATEWAY_GUARDRAILS_ENABLED="${AGENT_GUARDRAILS_ENABLED}" \
-        nohup setsid /usr/bin/salloc -p "$PARTITION" -J "$JOB_NAME" --cpus-per-task="$CPUS" --mem="$MEM" -t "$WALLTIME" $NODE_ARG \
+        LOGIN_GATEWAY_ANNOUNCE_PATH="${EFFECTIVE_ANNOUNCE_PATH}" \
+        nohup setsid /usr/bin/salloc -p "$PARTITION" -J "$JOB_NAME" --cpus-per-task="$CPUS" --mem="$MEM" -t "$WALLTIME" $SALLOC_EXTRA_FLAGS $NODE_ARG \
         /usr/bin/srun --overlap --export=ALL --container-image="$IMAGE" --container-mounts="$MOUNTS" $UNSHARE_ARG \
         "$ENTRYPOINT_CMD" </dev/null >>"$LOG_FILE" 2>&1 &
 fi

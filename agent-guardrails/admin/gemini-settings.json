@@ -1,0 +1,13 @@
+{
+  "general": {
+    "disableAutoUpdate": true,
+    "enableAutoUpdate": false,
+    "enableAutoUpdateNotification": false
+  },
+  "privacy": {
+    "usageStatisticsEnabled": false
+  },
+  "telemetry": {
+    "enabled": false
+  }
+}

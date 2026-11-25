@@ -6,8 +6,8 @@
 # secrets.DOCKER_HUB_TOKEN).
 #
 # Tags pushed:
-#   <repo>:<version>, <repo>:latest
-#   <repo>:admin-<version>, <repo>:admin
+#   <repo>:<image_tag>, <repo>:latest
+#   <repo>:admin-<image_tag>, <repo>:admin
 # =============================================================================
 name: Build and Push Login Image
 
@@ -15,13 +15,14 @@ on:
   workflow_dispatch:
     inputs:
       SLURM_VERSION_OVERRIDE:
-        description: 'Optional: Slurm deb version (e.g. 26.05.4-1). Leave empty for newest in warewulf-slurmd.'
+        description: 'Optional: Slurm deb version (e.g. 26.05.6-1). Leave empty for newest in warewulf-slurmd.'
         required: false
         default: ''
   push:
     branches:
       - main
     paths:
+      - 'IMAGE_RELEASE'
       - 'images/**'
       - 'status/**'
       - 'agent-guardrails/**'
@@ -59,30 +60,39 @@ jobs:
       - name: 🔍 Scan for secrets, credentials, and PII
         run: python3 tests/scan_secrets_pii.py
 
-      - name: 🎯 Determine Slurm Version & Stage DEBs
+      - name: 🎯 Determine Slurm DEB Version & Image Tag
         run: |
           set -e
           git clone --depth 1 https://github.com/ualberta-rcg/warewulf-slurmd /tmp/ww
           if [ -n "${{ github.event.inputs.SLURM_VERSION_OVERRIDE }}" ]; then
-            VERSION="${{ github.event.inputs.SLURM_VERSION_OVERRIDE }}"
-            echo "✅ Using manual override: $VERSION"
+            DEB_VERSION="${{ github.event.inputs.SLURM_VERSION_OVERRIDE }}"
+            echo "✅ Using manual override: $DEB_VERSION"
           else
-            VERSION=$(ls /tmp/ww/slurm-debs/slurm-smd_*_amd64_u2404.deb \
+            DEB_VERSION=$(ls /tmp/ww/slurm-debs/slurm-smd_*_amd64_u2404.deb \
               | sed -E 's/.*slurm-smd_([0-9]+\.[0-9]+\.[0-9]+-[0-9]+)_amd64_u2404\.deb/\1/' \
               | sort -V | tail -n1)
-            [ -z "$VERSION" ] && { echo "❌ No u2404 DEBs found in warewulf-slurmd."; exit 1; }
-            echo "🔬 Newest DEB version: $VERSION"
+            [ -z "$DEB_VERSION" ] && { echo "❌ No u2404 DEBs found in warewulf-slurmd."; exit 1; }
+            echo "🔬 Newest DEB version: $DEB_VERSION"
           fi
-          echo "version=$VERSION" >> $GITHUB_ENV
+          IMAGE_TAG="$DEB_VERSION"
+          if [ -s IMAGE_RELEASE ]; then
+            PIN_REL=$(tr -d '[:space:]' < IMAGE_RELEASE)
+            if [ "${PIN_REL%-*}" = "${DEB_VERSION%-*}" ]; then
+              IMAGE_TAG="$PIN_REL"
+            fi
+          fi
+          echo "🏷️ Publishing image tag: $IMAGE_TAG (Slurm DEBs: $DEB_VERSION)"
+          echo "deb_version=$DEB_VERSION" >> $GITHUB_ENV
+          echo "version=$IMAGE_TAG" >> $GITHUB_ENV
 
           mkdir -p debs
-          cp /tmp/ww/slurm-debs/*_${VERSION}_*_u2404.deb debs/ 2>/dev/null || true
-          [ -f "debs/slurm-smd_${VERSION}_amd64_u2404.deb" ] || { echo "❌ slurm-smd ${VERSION} DEB not found."; exit 1; }
-          [ -f "debs/slurm-smd-client_${VERSION}_amd64_u2404.deb" ] || { echo "❌ slurm-smd-client ${VERSION} DEB not found."; exit 1; }
+          cp /tmp/ww/slurm-debs/*_${DEB_VERSION}_*_u2404.deb debs/ 2>/dev/null || true
+          [ -f "debs/slurm-smd_${DEB_VERSION}_amd64_u2404.deb" ] || { echo "❌ slurm-smd ${DEB_VERSION} DEB not found."; exit 1; }
+          [ -f "debs/slurm-smd-client_${DEB_VERSION}_amd64_u2404.deb" ] || { echo "❌ slurm-smd-client ${DEB_VERSION} DEB not found."; exit 1; }
 
           if [ "${{ github.event_name }}" = "schedule" ] \
-             && curl -sf "https://hub.docker.com/v2/repositories/$DOCKER_REPO/tags/$VERSION" > /dev/null; then
-            echo "⏭️ Slurm $VERSION already published; nothing new. Skipping."
+             && curl -sf "https://hub.docker.com/v2/repositories/$DOCKER_REPO/tags/$IMAGE_TAG" > /dev/null; then
+            echo "⏭️ Image $IMAGE_TAG already published; nothing new. Skipping."
             echo "skip=true" >> $GITHUB_ENV
             exit 0
           fi
@@ -106,11 +116,9 @@ jobs:
           docker run --rm --entrypoint test $DOCKER_REPO:latest -s /etc/slurm-login-pods-release
           docker run --rm $CONFMNT --entrypoint srun $DOCKER_REPO:latest --version
           docker run --rm $CONFMNT --entrypoint sbatch $DOCKER_REPO:latest --version
-          docker run --rm --entrypoint test $DOCKER_REPO:latest -x /usr/local/bin/login-shell
-          docker run --rm --entrypoint test $DOCKER_REPO:latest -x /usr/local/bin/container-sshd-entrypoint
-          docker run --rm --entrypoint bash $DOCKER_REPO:latest -c 'test -L /usr/libexec/openssh/sftp-server && test -x /usr/libexec/openssh/sftp-server'
-          docker run --rm --entrypoint bash $DOCKER_REPO:latest -lc 'command -v sq && command -v login-pod && cluster-status --plain --only header'
-          docker run --rm --entrypoint bash $DOCKER_REPO:latest -c 'test -s /etc/claude-code/CLAUDE.md && test -d /etc/claude-code/.claude/skills/alliance-slurm'
+          docker run --rm --entrypoint bash $DOCKER_REPO:latest /usr/local/bin/login-shell -c 'echo "$PATH" | grep -q "/etc/cluster-status/bin" && cluster-status --plain --only header'
+          docker run --rm --entrypoint bash $DOCKER_REPO:latest -lc 'claude --version && codex --version && opencode --version && gemini --version && pi --version && cursor-agent --version && agy --version && uv --version && gh --version && globus version && ! command -v nmap'
+          docker run --rm --entrypoint bash $DOCKER_REPO:latest -c 'test -s /etc/claude-code/CLAUDE.md && test -s /etc/claude-code/managed-settings.json && agent-guardrails status'
           docker run --rm --entrypoint bash $DOCKER_REPO:latest -c 'ls /etc/ssh/ssh_host_* >/dev/null 2>&1 && exit 1 || exit 0'
 
       - name: 🐳 Build Admin Image
@@ -128,12 +136,10 @@ jobs:
         run: |
           set -e
           docker run --rm --entrypoint test $DOCKER_REPO:admin -s /etc/slurm-login-pods-release
-          docker run --rm --entrypoint test $DOCKER_REPO:admin -x /usr/local/bin/admin-container-sshd-entrypoint
-          docker run --rm --entrypoint test $DOCKER_REPO:admin -x /usr/local/bin/admin-login-shell
-          docker run --rm --entrypoint bash $DOCKER_REPO:admin -c 'test -L /usr/libexec/openssh/sftp-server && test -x /usr/libexec/openssh/sftp-server'
-          docker run --rm --entrypoint bash $DOCKER_REPO:admin -lc 'command -v sudo && command -v su && command -v sshd'
-          docker run --rm --entrypoint bash $DOCKER_REPO:admin -c 'find /lib /usr/lib -name pam_sss.so | grep -q pam_sss'
-          docker run --rm --entrypoint bash $DOCKER_REPO:admin -c 'test -f /etc/sudoers.d/gateway-admins && visudo -cf /etc/sudoers.d/gateway-admins'
+          docker run --rm --entrypoint bash $DOCKER_REPO:admin -lc 'command -v sudo && command -v su && command -v sshd && visudo -cf /etc/sudoers.d/gateway-admins'
+          docker run --rm --entrypoint bash $DOCKER_REPO:admin -lc 'claude --version && codex --version && opencode --version && gemini --version && pi --version && cursor-agent --version && agy --version'
+          docker run --rm --entrypoint bash $DOCKER_REPO:admin -c 'test ! -e /etc/claude-code/managed-settings.json && test ! -e /etc/codex/requirements.toml && test ! -d /etc/gemini-cli/policies'
+          docker run --rm --entrypoint bash $DOCKER_REPO:admin -lc 'kubectl version --client && helm version && k9s version && ansible --version && clush --version && ipmitool -V && nmap --version && tofu --version && aws --version && s5cmd version && openstack --version && perf --version'
           docker run --rm --entrypoint bash $DOCKER_REPO:admin -c 'ls /etc/ssh/ssh_host_* >/dev/null 2>&1 && exit 1 || exit 0'
 
       - name: 🔑 Docker Hub Login

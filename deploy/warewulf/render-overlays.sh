@@ -58,6 +58,7 @@ render_gateway_common() {
         "$root/usr/local/bin" \
         "$root/usr/local/sbin" \
         "$root/usr/libexec/openssh" \
+        "$root/etc/enroot/hooks.d" \
         "$root/etc/login-gateway/hooks" \
         "$root/etc/ssh/sshd_config.d" \
         "$root/etc/sudoers.d" \
@@ -106,7 +107,8 @@ render_gateway_common() {
     install -m 0440 "$REPO_ROOT/login-gateway/etc/sudoers.d/login-gateway" "$root/etc/sudoers.d/login-gateway"
     install -m 0440 "$REPO_ROOT/login-gateway/etc/sudoers.d/gateway-admins" "$root/etc/sudoers.d/gateway-admins"
 
-    # Systemd units & tmpfiles
+    # Systemd units, tmpfiles, and Enroot rootless UTS hostname hook
+    install -m 0755 "$REPO_ROOT/login-gateway/etc/enroot/hooks.d/50-login-pod-hostname.sh" "$root/etc/enroot/hooks.d/50-login-pod-hostname.sh"
     install -m 0644 "$REPO_ROOT/login-gateway/etc/systemd/system/login-gateway-keygen.service" "$root/etc/systemd/system/login-gateway-keygen.service"
     install -m 0644 "$REPO_ROOT/login-gateway/etc/systemd/system/login-gateway-xfer.slice" "$root/etc/systemd/system/login-gateway-xfer.slice"
     ln -sfn ../login-gateway-keygen.service "$root/etc/systemd/system/multi-user.target.wants/login-gateway-keygen.service"
@@ -118,12 +120,14 @@ render_cluster_status() {
     mkdir -p \
         "$root/usr/local/bin" \
         "$root/usr/local/sbin" \
-        "$root/etc/cluster-status" \
+        "$root/etc/cluster-status/bin" \
+        "$root/etc/cluster-status/announce.d" \
         "$root/etc/profile.d" \
         "$root/etc/systemd/system/timers.target.wants"
 
     install -m 0755 "$REPO_ROOT/status/bin/cluster-status" "$root/usr/local/bin/cluster-status"
     install -m 0755 "$REPO_ROOT/status/sbin/cluster-status-bake" "$root/usr/local/sbin/cluster-status-bake"
+    install -m 0755 "$REPO_ROOT/status/sbin/cluster-status-announce" "$root/usr/local/sbin/cluster-status-announce"
     install -m 0644 "$REPO_ROOT/status/etc/cluster-status/motd.conf.example" "$root/etc/cluster-status/motd.conf"
     install -m 0644 "$REPO_ROOT/status/etc/cluster-status/announce.txt" "$root/etc/cluster-status/announce.txt"
     install -m 0644 "$REPO_ROOT/status/etc/profile.d/zz-cluster-status.sh" "$root/etc/profile.d/zz-cluster-status.sh"
@@ -134,9 +138,11 @@ render_cluster_status() {
 
 render_agent_guardrails() {
     local root="$1"
-    mkdir -p "$root/etc" "$root/usr/share/agent-guardrails"
+    mkdir -p "$root/etc" "$root/usr/local/bin" "$root/usr/share/agent-guardrails"
+    install -m 0755 "$REPO_ROOT/agent-guardrails/bin/agent-guardrails" "$root/usr/local/bin/agent-guardrails"
     cp -a "$REPO_ROOT/agent-guardrails/etc/." "$root/etc/"
     cp -a "$REPO_ROOT/agent-guardrails/skills" "$root/usr/share/agent-guardrails/skills"
+    cp -a "$REPO_ROOT/agent-guardrails/community-skills" "$root/usr/share/agent-guardrails/community-skills"
 
     rm -rf "$root/etc/claude-code/.claude/skills" "$root/etc/agents/skills" "$root/etc/codex/skills"
     mkdir -p "$root/etc/claude-code/.claude"
@@ -158,6 +164,7 @@ render_login_pod_host() {
         "$root/etc/sysctl.d" \
         "$root/etc/tmpfiles.d" \
         "$root/etc/enroot/enroot.conf.d" \
+        "$root/etc/enroot/hooks.d" \
         "$root/etc/slurm/plugstack.d"
 
     cat > "$root/etc/sysctl.d/90-login-pods-userns.conf" <<'EOF'
@@ -176,6 +183,7 @@ ENROOT_MOUNT_HOME no
 ENROOT_RESTRICT_DEV yes
 ENROOT_ROOTFS_WRITABLE yes
 EOF
+    install -m 0755 "$REPO_ROOT/login-gateway/etc/enroot/hooks.d/50-login-pod-hostname.sh" "$root/etc/enroot/hooks.d/50-login-pod-hostname.sh"
     install -m 0644 "$REPO_ROOT/slurm/pyxis.conf.example" "$root/etc/slurm/plugstack.d/pyxis.conf.example"
 }
 

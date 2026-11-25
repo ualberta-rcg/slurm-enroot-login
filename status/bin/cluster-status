@@ -18,14 +18,26 @@ PATH=/usr/local/bin:/usr/bin:/bin
 
 PROG_NAME=$(basename "$0" 2>/dev/null || echo cluster-status)
 
+ENV_ANNOUNCE="${CLUSTER_STATUS_ANNOUNCE:-}"
 CONF="${CLUSTER_STATUS_CONF:-/etc/cluster-status/motd.conf}"
+# shellcheck disable=SC1090
 [ -r "$CONF" ] && . "$CONF"
+nodes_up=0; nodes_down=0; cpu_alloc=0; cpu_total=0; mem_alloc_mb=0; mem_total_mb=0
+gpu_alloc=0; gpu_total=0; gpu_usable=-1; queue_r=0; queue_pd=0
 if [ "$PROG_NAME" = "cluster-status" ] && [ -n "${STATUS_CMD_NAME:-}" ]; then
     PROG_NAME="$STATUS_CMD_NAME"
 fi
 
 # ---- defaults (override in /etc/cluster-status/motd.conf) -----------------
-ANNOUNCE=${ANNOUNCE:-/etc/cluster-status/announce.txt}
+if [ -n "$ENV_ANNOUNCE" ]; then
+    ANNOUNCE="$ENV_ANNOUNCE"
+elif [ -z "${ANNOUNCE:-}" ]; then
+    if [ -d /etc/cluster-status/announce.d ] && [ ! -s /etc/cluster-status/announce.txt ]; then
+        ANNOUNCE=/etc/cluster-status/announce.d
+    else
+        ANNOUNCE=/etc/cluster-status/announce.txt
+    fi
+fi
 LOGO_FILE=${LOGO_FILE:-/etc/cluster-status/logo.txt}
 LINKS_FILE=${LINKS_FILE:-/etc/cluster-status/links.txt}
 SITE_TITLE=${SITE_TITLE-Digital Research Alliance of Canada}
@@ -57,12 +69,14 @@ FAIRSHARE_TTL=${FAIRSHARE_TTL:-900}
 STORAGE_TTL=${STORAGE_TTL:-900}
 
 # ---- args -----------------------------------------------------------------
-PLAIN=0 NO_CACHE=0 ONLY="" WIDTH=0
-TUSER=${USER:-$(id -un 2>/dev/null)}
+PLAIN=0 NO_CACHE=0 ONLY="" WIDTH=0 CLI_ANNOUNCE=""
+CURRENT_USER=${USER:-$(id -un 2>/dev/null)}
+TUSER=$CURRENT_USER
 while [ $# -gt 0 ]; do
     case "$1" in
         --plain)    PLAIN=1 ;;
         --no-cache) NO_CACHE=1 ;;
+        --announce) CLI_ANNOUNCE=${2:-}; shift ;;
         --only)     ONLY=${2:-}; shift ;;
         --user)     TUSER=${2:-}; shift ;;
         --width)    WIDTH=${2:-0}; shift ;;
@@ -71,7 +85,8 @@ while [ $# -gt 0 ]; do
     esac
     shift
 done
-if [ "$TUSER" != "${USER:-}" ] && [ "$(id -u)" != "0" ]; then
+[ -n "$CLI_ANNOUNCE" ] && ANNOUNCE="$CLI_ANNOUNCE"
+if [ "$TUSER" != "$CURRENT_USER" ] && [ "$(id -u)" != "0" ]; then
     printf '%s: --user requires root\n' "$PROG_NAME" >&2; exit 2
 fi
 
@@ -283,11 +298,83 @@ LOGO
     fi
 }
 
+sanitize_notice_stream() {
+    # Strip ANSI CSI/OSC escape sequences and ASCII control bytes (preserving \t and \n)
+    LC_ALL=C sed -E \
+        -e $'s/\x1b\\[[0-9;?]*[ -/]*[@-~]//g' \
+        -e $'s/\x1b\\][^\x07\x1b]*(\x07|\x1b\\\\)//g' \
+        -e $'s/\x1b[@-_]//g' \
+        | LC_ALL=C tr -d '\000-\010\013\014\016-\037\177'
+}
+
+read_notice_file() {
+    local f="$1" now_epoch="$2"
+    [ -f "$f" ] && [ -r "$f" ] && [ -s "$f" ] || return 1
+    local first rest exp_raw exp_epoch
+    IFS= read -r first < "$f" || true
+    case "$first" in
+        [Ee][Xx][Pp][Ii][Rr][Ee][Ss]:*)
+            exp_raw="${first#*:}"
+            exp_raw="${exp_raw#"${exp_raw%%[![:space:]]*}"}"
+            exp_raw="${exp_raw%"${exp_raw##*[![:space:]]}"}"
+            exp_epoch=$(date -d "$exp_raw" +%s 2>/dev/null || echo "")
+            if [ -n "$exp_epoch" ] && [ "$now_epoch" -ge "$exp_epoch" ]; then
+                return 1
+            fi
+            rest=$(tail -n +2 -- "$f" 2>/dev/null | head -c 4096 | sanitize_notice_stream)
+            ;;
+        *)
+            rest=$(head -c 4096 -- "$f" 2>/dev/null | sanitize_notice_stream)
+            ;;
+    esac
+    # Trim leading/trailing blank lines
+    rest=$(printf '%s\n' "$rest" | awk 'NF {p=1} p {lines[++n]=$0} END {while (n>0 && lines[n] ~ /^[[:space:]]*$/) n--; for (i=1;i<=n;i++) print lines[i]}')
+    [ -n "$rest" ] || return 1
+    printf '%s\n' "$rest"
+}
+
 render_notice() {
-    [ -s "$ANNOUNCE" ] || return 0
+    local now_epoch combined="" chunk f nl_file
+    now_epoch=$(date +%s 2>/dev/null || echo 0)
+
+    # Maintenance lockout notice (/etc/nologin or /run/nologin)
+    for nl_file in "${CLUSTER_STATUS_NOLOGIN_FILE:-}" /etc/nologin /run/nologin; do
+        [ -n "$nl_file" ] && [ -f "$nl_file" ] && [ -r "$nl_file" ] && [ -s "$nl_file" ] || continue
+        chunk=$(head -c 2048 -- "$nl_file" 2>/dev/null | sanitize_notice_stream)
+        if [ -n "$chunk" ]; then
+            combined="[MAINTENANCE NOLOGIN] ${chunk}"
+            break
+        fi
+    done
+
+    if [ -d "$ANNOUNCE" ]; then
+        local -a files=()
+        while IFS= read -r f; do
+            [ -n "$f" ] && files+=("$f")
+        done < <(LC_ALL=C find "$ANNOUNCE" -maxdepth 1 -type f -name '*.txt' 2>/dev/null | LC_ALL=C sort)
+        for f in "${files[@]}"; do
+            if chunk=$(read_notice_file "$f" "$now_epoch"); then
+                if [ -n "$combined" ]; then
+                    combined=$(printf '%s\n\n%s' "$combined" "$chunk")
+                else
+                    combined="$chunk"
+                fi
+            fi
+        done
+    elif [ -f "$ANNOUNCE" ]; then
+        if chunk=$(read_notice_file "$ANNOUNCE" "$now_epoch"); then
+            if [ -n "$combined" ]; then
+                combined=$(printf '%s\n\n%s' "$combined" "$chunk")
+            else
+                combined="$chunk"
+            fi
+        fi
+    fi
+
+    [ -n "$combined" ] || return 0
     hdr 'Notice'
     c '33'
-    sed 's/^/  /' "$ANNOUNCE"
+    printf '%s\n' "$combined" | head -n 40 | sed 's/^/  /'
     c '0'
 }
 

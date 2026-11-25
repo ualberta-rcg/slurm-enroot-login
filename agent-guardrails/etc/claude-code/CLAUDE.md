@@ -1,66 +1,79 @@
 # Alliance HPC Cluster — Login Pod Guardrails
 
-You are running inside a **per-user Slurm login pod** (`login-<user>`) on a Digital Research Alliance of Canada (DRAC) HPC cluster.
+You are running inside a **per-user Slurm login pod** (`login-<user>`) on a Digital Research Alliance of Canada (DRAC) HPC cluster. Your pod has a **small, fixed CPU and RAM cgroup slice** — submit all compute, builds, training, and inference through Slurm (`sbatch` / `salloc`), never inside the login pod.
 
-- Your session runs inside an isolated container with a **small, fixed CPU and RAM slice** (check `login-pod status` or `cluster-status` for exact limits).
-- **Never run heavy compute, model training, inference, simulations, or multi-core builds inside the login pod** — the pod cgroup will throttle or OOM-kill your session. Submit all compute workloads through Slurm (`sbatch` / `salloc`).
-- **AI coding agents are strictly prohibited on MFA automation (`robot.*`) nodes** per Alliance automation policy. Only run agents inside interactive `login-<user>` pods or interactive compute allocations.
+## First 30 seconds
 
-**Check site-specific notes first.** If `/etc/agents/site.md` exists on this cluster, read it immediately before submitting jobs — it defines local partition rules, GPU models/MIG shards, default walltimes, storage quotas, and local portal URLs.
+1. **Read `/etc/agents/site.md` first** (if present) for this cluster's partitions, GPU/MIG types, `--account` rules, storage paths, portal URLs, and site status command name.
+2. **Check live cluster state & notices:** run `cluster-status --plain` (or the site status command listed in `/etc/agents/site.md`, exposed on `PATH` via `/etc/cluster-status/bin`) to inspect active announcements, free CPUs/GPUs, storage usage, and queue state.
+3. **Check your pod slice:** run `login-pod status` to see `$LOGIN_JOB_ID`, node placement, CPU/memory limits, and remaining walltime.
 
-**Use the installed Alliance skills:**
-- `alliance-slurm` — job scripts, GPUs/GRES, accounts, QOS, and queue inspection
-- `alliance-cvmfs` — CVMFS software stack, `module spider`, Lmod, and Python virtualenvs
-- `alliance-docs` — current Digital Research Alliance documentation lookup
-- `alliance-arbutus` — Arbutus OpenStack cloud and Terraform
-- `alliance-gitlab` — `git.computecanada.ca` workflows
+## Essential in-pod commands
 
-## Hard rules — shared cluster & resource-capped login pod
-
-- **Do not run compute, compile large trees, or `pip install` heavy packages directly in the login pod.** Offload to an `sbatch` job or `salloc` interactive allocation.
-- **Do not write job output, datasets, or caches to `$HOME`.** `$HOME` has a strict quota; direct all job I/O, caches (`HF_HOME`, `XDG_CACHE_HOME`), and virtualenvs to `$SCRATCH` or `$SLURM_TMPDIR`.
-- **Do not scan shared filesystems broadly.** Running `find` across `/`, `/home`, `/scratch`, or `/project` hammers shared metadata servers. Scope searches to a specific subdirectory.
-- **Do not poll Slurm in a tight loop.** Use `sbatch --wait` or check `sq` / `squeue -u "$USER"` at multi-minute intervals, never every few seconds.
-- **Do not guess cluster parameters.** Verify module versions (`module spider <name>`), GPU GRES names (`sinfo -o "%G" --Node | sort -u`), partitions (`sinfo -s`), and quotas (`diskusage_report`) before acting.
-- **Do not enter other users' directories** under `/home`, `/scratch`, or `/project*`.
-- **Do not read credentials** (`~/.ssh`, `.env`, tokens, `.netrc`, shell histories, `/etc/shadow`, `/etc/sssd`).
-- **Do not enumerate users or collect PII** (`getent passwd`, `ldapsearch`, or scraping other researchers' names, emails, or usernames).
-- **Do not expose restricted or unpublished research data** in prompts sent to external AI providers unless the user has explicitly confirmed authorization.
-
-## Two rules that prevent most Slurm failures
-
-1. **Never guess module versions.** Run `module spider <name>` before `module load`. Load modules explicitly inside every `#SBATCH` script.
-2. **Never guess GPU types.** Inspect `sinfo -o "%N %P %G" --Node | sort -u` (and `/etc/agents/site.md` if present) and request explicit typed GRES (`--gres=gpu:<model>:<count>`), unless site documentation specifies otherwise.
-
-## Slurm essentials
-
-- Always specify `--cpus-per-task`, `--mem`, `--time`, and `--account` (if required by the cluster's `job_submit.lua` plugin — check `sacctmgr -nP show assoc where user=$USER format=account`).
-- Request only the CPUs, memory, GPUs, and walltime the workload actually needs; over-requesting increases queue wait time.
-- Use `sq` to inspect your active jobs, `seff <jobid>` to review CPU/RAM efficiency of completed jobs, and `login-pod status` to inspect your login pod's remaining walltime and node placement.
-- If you were recently added to a new project group, run `login-pod restart` from a fresh SSH login so your pod picks up updated supplementary groups.
-
-## Software (CVMFS via Lmod)
-
-- `module spider <pkg>` searches the entire CVMFS software tree; `module avail` only shows currently unlocked compiler/MPI tiers.
-- Python workflow: `module load python/<ver>`, create virtualenvs on `$SCRATCH` or inside `$SLURM_TMPDIR` using `virtualenv --no-download`, and install wheels from the Alliance wheelhouse with `pip install --no-index <pkg>`.
-- Compute nodes may not have direct outbound internet access; stage datasets, models, and wheels before submitting batch jobs.
-
-## Storage layout
-
-| Filesystem | Typical Path | Purpose | Backed Up |
-|---|---|---|---|
-| `$HOME` | `/home/<user>` | Source code, small configs, scripts | Typically yes |
-| `$SCRATCH` | `/scratch/<user>` (`~/scratch`) | Active job I/O, checkpoints, caches (subject to purge) | No |
-| `$PROJECT` | `/project/...` or `/projects/...` (`~/projects`) | Shared group datasets & curated results | Site-dependent |
-|Pod `/tmp` | `/tmp` (inside login pod) | Ephemeral pod-private scratch (`XDG_RUNTIME_DIR`); wiped when pod stops | No |
-| Job `$SLURM_TMPDIR` | Node-local scratch in compute jobs | High-IOPS per-job temporary files; wiped at job end | No |
-
-Check quota usage before large writes with `diskusage_report`.
-
-## Alliance resources
-
-| Resource | Location |
+| Command | Purpose |
 |---|---|
-| Alliance Technical Documentation | https://docs.alliancecan.ca |
-| Alliance Support | support@tech.alliancecan.ca |
-| Local cluster URLs & status | Run `cluster-status` or check `/etc/agents/site.md` |
+| `cluster-status --plain` | Live node/GPU availability, operator announcements, quotas, and pod summary (non-interactive friendly) |
+| `login-pod status` | Show your login pod's Slurm JobId (`$LOGIN_JOB_ID`), node (`$LOGIN_POD_NODE`), cgroup limits, and time left |
+| `login-pod restart` | Tear down and respawn your pod on next login (e.g. to pick up new POSIX group memberships) |
+| `sq` | Compact view of your queued and running Slurm jobs (`squeue --me`) |
+| `seff <jobid>` | Post-run CPU and memory efficiency report for a completed job |
+| `diskusage_report` | Quota and file-count usage across `$HOME`, `$SCRATCH`, and `$PROJECT` |
+| `module spider <name>` | Search the full CVMFS/Lmod software catalog before `module load` |
+| `agent-guardrails status` | Check active AI guardrail links and list opt-in skills (`agent-guardrails list-community`) |
+
+## Login pod environment & persistence
+
+- **Key environment variables:** `$LOGIN_SESSION_MODE` (`login`, `robot`, or `admin`), `$LOGIN_JOB_ID` (your pod's Slurm JobId), `$LOGIN_POD_NODE`, and `$CC_CLUSTER`.
+- **Disconnect survival:** Your login pod and its `tmux` server persist across SSH disconnects until the pod walltime expires. Use `tmux new -As work` for long interactive workflows.
+- **Never `scancel` your own `login-*` job (`$LOGIN_JOB_ID`)!** Cancelling `$LOGIN_JOB_ID` terminates the container running your shell and kills this agent immediately.
+- **No agents on `robot.*`:** AI coding agents are prohibited in unattended `robot` sessions (`LOGIN_SESSION_MODE=robot`).
+
+## Hard rules
+
+- **No heavy compute in the login pod:** Do not run training, inference, simulations, multi-core builds (`make -j`), or heavy package compiles locally; offload to `sbatch` or `salloc`.
+- **Keep job I/O and caches off `$HOME`:** Direct datasets, checkpoints, virtualenvs, `HF_HOME`, `PIP_CACHE_DIR`, and `UV_CACHE_DIR` to `$SCRATCH` or job-local `$SLURM_TMPDIR`.
+- **No broad filesystem scans:** Never run `find`, `du`, or `rg` across `/`, `/home`, `/scratch`, or `/project*` roots — scope to a specific project subdirectory.
+- **No tight Slurm polling:** Poll `sq` / `squeue` no faster than every 2–5 minutes, or use `sbatch --wait` for short test jobs.
+- **Never guess modules or GPUs:** Verify exact versions with `module spider <pkg>` and GPU GRES strings with `sinfo -o "%N %P %G" --Node | sort -u` ( plus `/etc/agents/site.md`).
+- **Privacy, credentials, and multi-tenancy:** Never access other users' directories under `/home`, `/scratch`, or `/project*`; never read `~/.ssh`, `.env*`, tokens, `.netrc`, `/etc/shadow`, or `/etc/sssd`; never enumerate accounts (`getent passwd`, `ldapsearch`); do not send restricted or unpublished research data to external AI APIs without explicit user authorization.
+
+## Minimal Slurm templates
+
+Check `sacctmgr -nP show assoc where user="$USER" format=account` (and `/etc/agents/site.md`) to see whether `--account=` is required on this cluster.
+
+```bash
+# CPU batch job (submit with: sbatch job_cpu.sh)
+#!/bin/bash
+#SBATCH --job-name=cpu-work
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=16G
+#SBATCH --time=01:00:00
+#SBATCH --output=%x-%j.out
+
+module purge
+# module load python/3.11 scipy-stack   # verify with: module spider python
+virtualenv --no-download "$SLURM_TMPDIR/venv"
+source "$SLURM_TMPDIR/venv/bin/activate"
+pip install --no-index --upgrade pip
+python my_script.py --out "$SCRATCH/results/$SLURM_JOB_ID"
+```
+
+```bash
+# GPU batch job — check typed GRES in /etc/agents/site.md or sinfo -o "%N %P %G" --Node
+#!/bin/bash
+#SBATCH --job-name=gpu-work
+#SBATCH --gpus-per-node=1
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=32G
+#SBATCH --time=02:00:00
+#SBATCH --output=%x-%j.out
+
+nvidia-smi
+srun python train.py --data "$SCRATCH/data" --ckpt "$SCRATCH/runs/$SLURM_JOB_ID"
+```
+
+For quick interactive testing on a compute node: `salloc --cpus-per-task=2 --mem=8G --time=00:30:00`.
+
+## Installed Alliance skills
+
+Invoke or consult: `alliance-slurm`, `alliance-cvmfs`, `alliance-docs` (https://docs.alliancecan.ca), `alliance-arbutus`, and `alliance-gitlab`. Additional opt-in research skills (`alliance-jax`, `alliance-containers`, `alliance-storage`, `alliance-rac`, etc.) can be installed per user via `agent-guardrails install-community <skill>`.

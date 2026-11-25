@@ -37,3 +37,7 @@ To preserve the key's `command=` while still confining execution:
 ## Shared Port-22 Mode (`ROBOT_MODE="port22"`)
 
 Smaller clusters without a separate `robot.<cluster>` IP can set `ROBOT_MODE="port22"`. In this mode, `login-gateway-authorized-keys` injects `environment="LOGIN_KEY_TYPE=robot"` + `--rewrite-dispatch` onto valid automation keys on port 22, and a PAM rule skips Duo only when an automation key authenticated the session.
+
+## SSSD / CCDB Requirement (Non-CILogon Sites Only)
+
+Alliance MFA automation (`robot.<cluster>`) relies on SSH public keys stored in **CCDB / LDAP and resolved directly via SSSD** (`sss_ssh_authorizedkeys`). Sites that authenticate SSH sessions through a synthetic OIDC / CILogon NSS shim account (`SHIM_USERS` + `/etc/login-gateway/hooks/identity`) **must set `ROBOT_ENABLED="0"`** in `/etc/login-gateway/login-gateway.conf`; `route` explicitly refuses `--robot` sessions whenever the caller resolved via `SHIM_USERS`.

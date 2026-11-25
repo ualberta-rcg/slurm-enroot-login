@@ -48,8 +48,11 @@ XDG_RT="/tmp/run-$(id -u)"
 mkdir -p "$XDG_RT" 2>/dev/null && chmod 700 "$XDG_RT" 2>/dev/null && export XDG_RUNTIME_DIR="$XDG_RT"
 
 export OMPI_MCA_rmaps_base_oversubscribe=1
+if [[ -d /etc/cluster-status/bin && ":${PATH:-}:" != *":/etc/cluster-status/bin:"* ]]; then
+    export PATH="${PATH:+$PATH:}/etc/cluster-status/bin"
+fi
 
-cd "${HOME:-/tmp}" 2>/dev/null || cd /tmp
+cd "${HOME:-/tmp}" 2>/dev/null || cd /tmp || exit 1
 
 if [[ $# -eq 0 ]]; then
     exec "${SHELL:-/bin/bash}" -l

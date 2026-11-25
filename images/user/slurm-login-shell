@@ -7,7 +7,7 @@
 #     keep the submission cwd, no forced login shell
 case "${SLURM_JOB_PARTITION:-}" in
     login)
-        cd "${HOME:-/tmp}" 2>/dev/null || cd /tmp
+        cd "${HOME:-/tmp}" 2>/dev/null || cd /tmp || exit 1
         exec "${SHELL:-/bin/bash}" -l
         ;;
     *)

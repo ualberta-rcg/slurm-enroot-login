@@ -14,6 +14,7 @@ SETTINGS=/etc/claude-code/managed-settings.json
 BANNER_TITLE="ALLIANCE HPC"
 BANNER_SUBTITLE="Claude Code · Login Pod Guardrails · Digital Research Alliance of Canada"
 BANNER_FOOTER="Docs: docs.alliancecan.ca · Support: support@tech.alliancecan.ca"
+STATUS_CMD="cluster-status"
 
 if [ -f /etc/claude-code/site-banner.env ]; then
   # shellcheck disable=SC1091
@@ -60,7 +61,7 @@ messages=(
 quote="${messages[$RANDOM % ${#messages[@]}]}"
 
 QUOTE="$quote" TMPFILE="$TMPFILE" \
-BANNER_TITLE="$BANNER_TITLE" BANNER_SUBTITLE="$BANNER_SUBTITLE" BANNER_FOOTER="$BANNER_FOOTER" \
+BANNER_TITLE="$BANNER_TITLE" BANNER_SUBTITLE="$BANNER_SUBTITLE" BANNER_FOOTER="$BANNER_FOOTER" STATUS_CMD="$STATUS_CMD" \
 python3 - << 'PYEOF'
 import json, os
 
@@ -70,6 +71,7 @@ quote = os.environ['QUOTE']
 title = os.environ['BANNER_TITLE']
 subtitle = os.environ['BANNER_SUBTITLE']
 footer = os.environ['BANNER_FOOTER']
+status_cmd = os.environ.get('STATUS_CMD', 'cluster-status') or 'cluster-status'
 
 R = "\x1b[0m"
 B = "\x1b[1m"
@@ -82,7 +84,7 @@ MAGENTA = "\x1b[35m"
 banner = [
     f"{B}{CYAN}{title}{R}  {D}{subtitle}{R}",
     "",
-    f"{B}{YELLOW}You are inside a shared cluster login pod, not a personal workstation.{R} Site-managed settings, skills, and guardrails are active here. Everything the agent runs executes under your account and remains your responsibility.",
+    f"{B}{YELLOW}You are inside a shared cluster login pod, not a personal workstation.{R} Site-managed settings, skills, and guardrails are active here. Everything the agent runs executes under your account and remains your responsibility. Run {B}{status_cmd}{R} for live cluster status.",
     "",
     f"{B}{YELLOW}What we expect of you:{R}",
     f"{B}Review every command{R} the agent proposes before approving it.",

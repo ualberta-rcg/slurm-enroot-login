@@ -1,5 +1,6 @@
 {
   "general": {
+    "disableAutoUpdate": true,
     "enableAutoUpdate": false,
     "enableAutoUpdateNotification": false
   },

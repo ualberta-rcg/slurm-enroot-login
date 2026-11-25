@@ -1,0 +1,222 @@
+#!/usr/bin/env bash
+# /usr/local/bin/agent-guardrails — link and inspect AI coding agent guardrails & skills
+#
+# Usage:
+#   agent-guardrails link [--admin]
+#   agent-guardrails status
+#   agent-guardrails list-community
+#   agent-guardrails install-community <skill|--all>
+#
+# Safety guarantees:
+#   - No-op in robot.* automation sessions (LOGIN_SESSION_MODE=robot).
+#   - Idempotent: never overwrites a user's existing files or symlinks in $HOME.
+#   - In --admin mode (or admin pods with LOGIN_GUARDRAILS_ENABLED=0), links
+#     only skills and informational AGENTS.md without policy restriction files.
+
+set -euo pipefail
+
+SKILLS_SRC="/etc/claude-code/.claude/skills"
+[[ -d "$SKILLS_SRC" ]] || SKILLS_SRC="/usr/share/agent-guardrails/skills"
+COMMUNITY_SRC="/usr/share/agent-guardrails/community-skills"
+AGENTS_MD="/etc/agents/AGENTS.md"
+PI_EXT="/etc/pi/extensions/hpc-guardrails.ts"
+CURSOR_CFG="/etc/cursor/cli-config.json"
+
+usage() {
+    cat <<'EOF'
+Usage: agent-guardrails <command> [options]
+
+Commands:
+  link [--admin]                   Idempotently link skills & instructions into $HOME
+  status                           Display active harness policies, skills, and $HOME links
+  list-community                   List opt-in scientific & HPC community skills
+  install-community <skill|--all>  Link opt-in community skill(s) into $HOME harnesses
+EOF
+}
+
+link_if_absent() {
+    local src="$1" dst="$2"
+    [[ -e "$src" ]] || return 0
+    if [[ ! -e "$dst" && ! -L "$dst" ]]; then
+        ln -s "$src" "$dst" 2>/dev/null || true
+    fi
+}
+
+cmd_link() {
+    local force_admin=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --admin) force_admin=1; shift ;;
+            *) echo "agent-guardrails link: unknown option '$1'" >&2; exit 2 ;;
+        esac
+    done
+
+    local mode="${LOGIN_SESSION_MODE:-login}"
+    local enabled="${LOGIN_GUARDRAILS_ENABLED:-1}"
+
+    [[ "$mode" == "robot" ]] && return 0
+    if [[ "$mode" != "admin" && "$force_admin" -eq 0 && "$enabled" == "0" ]]; then
+        return 0
+    fi
+
+    local is_unrestricted_admin=0
+    if [[ "$force_admin" -eq 1 ]] || [[ "$mode" == "admin" && "$enabled" == "0" ]]; then
+        is_unrestricted_admin=1
+    fi
+
+    [[ -n "${HOME:-}" && -d "$HOME" && -w "$HOME" ]] || return 0
+
+    if [[ -d "$SKILLS_SRC" ]]; then
+        local d s n
+        for d in \
+            "$HOME/.agents/skills" \
+            "$HOME/.codex/skills" \
+            "$HOME/.cursor/skills" \
+            "$HOME/.gemini/antigravity-cli/skills" \
+            "$HOME/.pi/agent/skills"; do
+            mkdir -p "$d" 2>/dev/null || continue
+            for s in "$SKILLS_SRC"/*/; do
+                [[ -d "$s" ]] || continue
+                n="$(basename "$s")"
+                link_if_absent "${s%/}" "$d/$n"
+            done
+        done
+    fi
+
+    if [[ -f "$AGENTS_MD" ]]; then
+        local ad
+        for ad in "$HOME/.codex" "$HOME/.gemini" "$HOME/.pi/agent"; do
+            mkdir -p "$ad" 2>/dev/null || continue
+            link_if_absent "$AGENTS_MD" "$ad/AGENTS.md"
+        done
+    fi
+
+    if [[ "$is_unrestricted_admin" -eq 0 ]]; then
+        if [[ -f "$PI_EXT" ]]; then
+            mkdir -p "$HOME/.pi/agent/extensions" 2>/dev/null || true
+            link_if_absent "$PI_EXT" "$HOME/.pi/agent/extensions/hpc-guardrails.ts"
+        fi
+        if [[ -f "$CURSOR_CFG" ]]; then
+            mkdir -p "$HOME/.cursor" 2>/dev/null || true
+            link_if_absent "$CURSOR_CFG" "$HOME/.cursor/cli-config.json"
+        fi
+    fi
+}
+
+state_label() {
+    local p="$1"
+    if [[ -e "$p" ]]; then
+        printf 'present'
+    else
+        printf 'absent'
+    fi
+}
+
+cmd_status() {
+    local mode="${LOGIN_SESSION_MODE:-login}"
+    local enabled="${LOGIN_GUARDRAILS_ENABLED:-1}"
+    local policy_state="enforced"
+    if [[ "$mode" == "robot" ]]; then
+        policy_state="disabled (robot session)"
+    elif [[ "$mode" == "admin" && "$enabled" == "0" ]]; then
+        policy_state="informational (admin unrestricted)"
+    elif [[ "$enabled" == "0" ]]; then
+        policy_state="disabled"
+    fi
+
+    local core_count=0 comm_count=0
+    if [[ -d "$SKILLS_SRC" ]]; then
+        core_count=$(find -L "$SKILLS_SRC" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')
+    fi
+    if [[ -d "$COMMUNITY_SRC" ]]; then
+        comm_count=$(find -L "$COMMUNITY_SRC" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')
+    fi
+
+    printf 'Session mode        : %s\n' "$mode"
+    printf 'Guardrails policy   : %s\n' "$policy_state"
+    printf 'Core skills         : %s (%s)\n' "$core_count" "$SKILLS_SRC"
+    printf 'Community skills    : %s opt-in (%s)\n' "$comm_count" "$COMMUNITY_SRC"
+    printf 'Claude instructions : %s (/etc/claude-code/CLAUDE.md)\n' "$(state_label /etc/claude-code/CLAUDE.md)"
+    printf 'Claude restrictions : %s (/etc/claude-code/managed-settings.json)\n' "$(state_label /etc/claude-code/managed-settings.json)"
+    printf 'Shared AGENTS.md    : %s (/etc/agents/AGENTS.md)\n' "$(state_label /etc/agents/AGENTS.md)"
+    printf 'Site notes          : %s (/etc/agents/site.md)\n' "$(state_label /etc/agents/site.md)"
+    printf 'Codex requirements  : %s (/etc/codex/requirements.toml)\n' "$(state_label /etc/codex/requirements.toml)"
+    printf 'Gemini policies     : %s (/etc/gemini-cli/policies/hpc-guardrails.toml)\n' "$(state_label /etc/gemini-cli/policies/hpc-guardrails.toml)"
+    printf 'OpenCode config     : %s (/etc/opencode/opencode.json)\n' "$(state_label /etc/opencode/opencode.json)"
+    printf 'Cursor CLI config   : %s (/etc/cursor/cli-config.json)\n' "$(state_label /etc/cursor/cli-config.json)"
+    printf 'Pi guardrail ext    : %s (/etc/pi/extensions/hpc-guardrails.ts)\n' "$(state_label /etc/pi/extensions/hpc-guardrails.ts)"
+
+    if [[ -n "${HOME:-}" && -d "$HOME" ]]; then
+        printf 'Home skill links    : codex=%s gemini=%s cursor=%s pi=%s agents=%s\n' \
+            "$(state_label "$HOME/.codex/skills")" \
+            "$(state_label "$HOME/.gemini/antigravity-cli/skills")" \
+            "$(state_label "$HOME/.cursor/skills")" \
+            "$(state_label "$HOME/.pi/agent/skills")" \
+            "$(state_label "$HOME/.agents/skills")"
+    fi
+}
+
+cmd_list_community() {
+    if [[ ! -d "$COMMUNITY_SRC" ]]; then
+        echo "No community skills directory found at ${COMMUNITY_SRC}." >&2
+        exit 1
+    fi
+    local s
+    for s in "$COMMUNITY_SRC"/*/; do
+        [[ -d "$s" ]] || continue
+        basename "$s"
+    done
+}
+
+install_one_community() {
+    local name="$1"
+    local src="${COMMUNITY_SRC}/${name}"
+    if [[ ! -d "$src" ]]; then
+        echo "agent-guardrails: unknown community skill '${name}'" >&2
+        return 1
+    fi
+    local d
+    for d in \
+        "$HOME/.claude/skills" \
+        "$HOME/.agents/skills" \
+        "$HOME/.codex/skills" \
+        "$HOME/.cursor/skills" \
+        "$HOME/.gemini/antigravity-cli/skills" \
+        "$HOME/.pi/agent/skills"; do
+        mkdir -p "$d" 2>/dev/null || continue
+        link_if_absent "$src" "$d/$name"
+    done
+    printf 'Linked community skill: %s\n' "$name"
+}
+
+cmd_install_community() {
+    local target="${1:-}"
+    if [[ -z "$target" ]]; then
+        echo "Usage: agent-guardrails install-community <skill|--all>" >&2
+        exit 2
+    fi
+    if [[ -z "${HOME:-}" || ! -d "$HOME" || ! -w "$HOME" ]]; then
+        echo "ERROR: writable HOME is required to link community skills." >&2
+        exit 1
+    fi
+    if [[ "$target" == "--all" ]]; then
+        local s
+        for s in "$COMMUNITY_SRC"/*/; do
+            [[ -d "$s" ]] || continue
+            install_one_community "$(basename "$s")"
+        done
+    else
+        install_one_community "$target"
+    fi
+}
+
+subcmd="${1:-status}"
+shift || true
+case "$subcmd" in
+    link)              cmd_link "$@" ;;
+    status)            cmd_status "$@" ;;
+    list-community)    cmd_list_community "$@" ;;
+    install-community) cmd_install_community "$@" ;;
+    -h|--help|help)    usage ;;
+    *) echo "agent-guardrails: unknown command '$subcmd'" >&2; usage >&2; exit 2 ;;
+esac

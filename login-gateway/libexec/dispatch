@@ -67,6 +67,14 @@ in_word_list() {
 }
 
 CURRENT_USER="${USER:-$(id -un 2>/dev/null || true)}"
+_RAW_SSH_CONN="${SSH_CONNECTION:-}"
+CLIENT_IP="${_RAW_SSH_CONN%% *}"
+CLIENT_IP=$(printf '%s' "${CLIENT_IP:-local}" | tr -cd '0-9a-fA-F.:-')
+[[ -z "$CLIENT_IP" ]] && CLIENT_IP="local"
+
+audit_log() {
+    command -v logger >/dev/null 2>&1 && logger -t login-gateway -- "$*" 2>/dev/null || true
+}
 
 # Fast-path transfers directly as the authenticated user when not using a
 # synthetic shim account (shim accounts delegate to `route` so hooks/identity
@@ -75,6 +83,7 @@ if [[ "$TRANSFER_FASTPATH" == "1" ]] && ! in_word_list "$CURRENT_USER" "$SHIM_US
     CANDIDATE_CMD="${SSH_ORIGINAL_COMMAND:-}"
     [[ "$HAS_FORCED_CMD" -eq 1 ]] && CANDIDATE_CMD="$FORCED_CMD"
     if [[ -n "$CANDIDATE_CMD" ]] && classify_transfer_cmd "$CANDIDATE_CMD" "${SSH_ORIGINAL_COMMAND:-}"; then
+        audit_log "event=transfer_fastpath user=${CURRENT_USER} mode=${FORCE_ROBOT:+robot-}transfer target=gateway ip=${CLIENT_IP}"
         export SSH_ORIGINAL_COMMAND="${NORMALIZED_XFER_ORIG_CMD}"
         read -r -a XFER_ARGV <<< "$NORMALIZED_XFER_CMD"
         if [[ "${XFER_ARGV[0]}" == "/usr/bin/scp" ]] && ! [[ -x /usr/bin/scp ]]; then

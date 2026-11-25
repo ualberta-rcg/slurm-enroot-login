@@ -161,6 +161,7 @@ classify_transfer_cmd() {
                     NORMALIZED_XFER_ORIG_CMD="/usr/libexec/openssh/sftp-server${orig_trimmed#sftp-server}"
                     ;;
                 internal-sftp*)
+                    # shellcheck disable=SC2034
                     NORMALIZED_XFER_ORIG_CMD="/usr/libexec/openssh/sftp-server${orig_trimmed#internal-sftp}"
                     ;;
             esac

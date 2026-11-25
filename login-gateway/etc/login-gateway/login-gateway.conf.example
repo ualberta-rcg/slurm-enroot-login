@@ -19,6 +19,11 @@ LOGIN_CPUS="4"
 LOGIN_MEM="4G"
 LOGIN_WALLTIME="7-00:00:00"
 
+# Request --oversubscribe for login/robot pods and prefer spawning on the local
+# gateway host when it has free capacity in LOGIN_PARTITION (falls back automatically).
+POD_OVERSUBSCRIBE="1"
+PREFER_LOCAL_NODE="1"
+
 # Seconds to wait for a cold Slurm pod allocation to become ready
 WAIT_TIMEOUT="60"
 
@@ -28,7 +33,9 @@ POD_HOSTNAME_TEMPLATE="%c-%m-%u"
 
 # Direct gateway file transfer fast-path (scp / sftp / rsync / rrsync + CVMFS transfer wrappers).
 # When 1, validated transfers execute on the gateway inside XFER_SLICE with zero Slurm jobs.
+# TRANSFER_SANDBOX="1" isolates gateway transfers via ProtectSystem=strict + InaccessiblePaths.
 TRANSFER_FASTPATH="1"
+TRANSFER_SANDBOX="1"
 XFER_SLICE="login-gateway-xfer.slice"
 XFER_MEM_HIGH="256M"
 XFER_MEM_MAX="512M"
@@ -74,9 +81,14 @@ FALLBACK_MEM_MAX="512M"
 FALLBACK_CPU_QUOTA="50%"
 FALLBACK_TASKS_MAX="32"
 
-# Toggle login status banner (cluster-status) and AI coding agent guardrails
+# Toggle login status banner (cluster-status) and AI coding agent guardrails.
+# ADMIN_AGENT_GUARDRAILS="0" keeps skills + site.md + status in admin-<user> pods
+# while omitting user-pod command deny/ask restrictions (set "1" to enforce in admin pods too).
 STATUS_ENABLED="1"
+# Optional shared announcement file or announce.d directory bind-mounted read-only into login/admin pods
+STATUS_ANNOUNCE_PATH=""
 AGENT_GUARDRAILS_ENABLED="1"
+ADMIN_AGENT_GUARDRAILS="0"
 
 # Minimum UID treated as a normal cluster user (system accounts below this are ignored)
 MIN_CLUSTER_UID="10000"

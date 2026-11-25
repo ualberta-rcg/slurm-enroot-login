@@ -18,7 +18,12 @@ done
 LOGIN_PARTITION="${LOGIN_PARTITION:-login}"
 ADMIN_PARTITION="${ADMIN_PARTITION:-$LOGIN_PARTITION}"
 TARGET_USER=""
-MODE="all"
+MODE=""
+
+usage() {
+    echo "Usage: stop <username> [login|robot|admin|all]   (default: login)" >&2
+    echo "       stop --user <username> [--mode login|robot|admin|all]" >&2
+}
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -27,22 +32,32 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --mode|-m)
-            MODE="${2:-all}"
+            MODE="${2:-}"
             shift 2
             ;;
         *)
             if [[ -z "$TARGET_USER" ]]; then
                 TARGET_USER="$1"
+            elif [[ -z "$MODE" ]]; then
+                MODE="$1"
+            else
+                usage
+                exit 1
             fi
             shift
             ;;
     esac
 done
 
+MODE="${MODE:-login}"
 if [[ -z "$TARGET_USER" || ! "$TARGET_USER" =~ ^[a-zA-Z0-9._-]+$ ]]; then
-    echo "Usage: stop --user <username> [--mode all|login|robot|admin]" >&2
+    usage
     exit 1
 fi
+case "$MODE" in
+    login|robot|admin|all) ;;
+    *) usage; exit 1 ;;
+esac
 
 stop_one_mode() {
     local m="$1"
@@ -90,7 +105,7 @@ case "$MODE" in
     login) stop_one_mode login ;;
     robot) stop_one_mode robot ;;
     admin) stop_one_mode admin ;;
-    all|*)
+    all)
         stop_one_mode login
         stop_one_mode robot
         stop_one_mode admin

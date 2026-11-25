@@ -2,10 +2,10 @@
 # slurm-login-pods: Image & Gateway Suite Test (no push)
 # =============================================================================
 # Runs on every branch push, pull request, and manual dispatch:
-#   1. Secret + PII scan (`tests/scan_secrets_pii.py`)
-#   2. Shellcheck / syntax checks + Python unittest + BATS tests
+#   1. Secret + PII scan (`tests/scan_secrets_pii.py`) + gitleaks (tree + history)
+#   2. ShellCheck (-S warning), Bandit, Python unittest, and BATS suites
 #   3. Docker build of BOTH user (`images/user/Dockerfile`) and admin
-#      (`images/admin/Dockerfile`) images + smoke tests (no push to Docker Hub)
+#      (`images/admin/Dockerfile`) images + comprehensive smoke tests + Trivy report
 # =============================================================================
 name: Test Login Images & Gateway
 
@@ -13,7 +13,7 @@ on:
   workflow_dispatch:
     inputs:
       SLURM_VERSION_OVERRIDE:
-        description: 'Optional: Slurm deb version (e.g. 26.05.4-1). Leave empty for newest.'
+        description: 'Optional: Slurm deb version (e.g. 26.05.6-1). Leave empty for newest.'
         required: false
         default: ''
   push:
@@ -25,46 +25,63 @@ concurrency:
 
 jobs:
   secrets-and-unit-tests:
-    name: 🔍 Secrets/PII Scan & Gateway Tests
+    name: 🔍 Secrets/PII, Security Linters & Gateway Tests
     runs-on: ubuntu-24.04
     steps:
-      - name: 🛠️ Checkout Repository
+      - name: 🛠️ Checkout Repository (full history for gitleaks)
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: 📦 Install bats & shellcheck
+      - name: 📦 Install bats, shellcheck, bandit & gitleaks
         run: |
+          set -e
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends bats shellcheck
+          sudo apt-get install -y --no-install-recommends bats shellcheck python3-bandit
+          GITLEAKS_VER="8.30.1"
+          GITLEAKS_SHA="551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+          curl -fsSL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VER}/gitleaks_${GITLEAKS_VER}_linux_x64.tar.gz" -o /tmp/gitleaks.tgz
+          echo "${GITLEAKS_SHA}  /tmp/gitleaks.tgz" | sha256sum -c -
+          sudo tar -xzf /tmp/gitleaks.tgz -C /usr/local/bin gitleaks
+          sudo chmod 0755 /usr/local/bin/gitleaks
 
-      - name: 🔍 Scan for secrets, credentials, and PII
-        run: python3 tests/scan_secrets_pii.py
+      - name: 🔍 Scan for secrets, credentials, and PII (repo + git history)
+        run: |
+          set -e
+          python3 tests/scan_secrets_pii.py
+          gitleaks dir --no-banner --redact .
+          gitleaks git --no-banner --redact .
 
-      - name: 🧪 Syntax & ShellCheck validation
+      - name: 🧪 Syntax, ShellCheck (-S warning) & Bandit validation
         run: |
           set -e
           bash -n images/user/login-shell images/user/slurm-login-shell images/user/container-sshd-entrypoint
           bash -n images/user/bin/* images/user/profile.d/*.sh
           bash -n images/admin/admin-login-shell images/admin/admin-container-sshd-entrypoint
           bash -n login-gateway/libexec/* login-gateway/bin/enter-login-job
+          bash -n login-gateway/etc/enroot/hooks.d/50-login-pod-hostname.sh
           bash -n login-gateway/sbin/login-gateway-authorized-keys login-gateway/sbin/sss_ssh_authorizedkeys.filter
-          bash -n status/bin/cluster-status status/sbin/cluster-status-bake status/etc/profile.d/zz-cluster-status.sh
-          bash -n agent-guardrails/etc/claude-code/update-motd.sh agent-guardrails/etc/profile.d/ai-agent-skills.sh
-          bash -n deploy/warewulf/render-overlays.sh deploy/standalone/install.sh
-          shellcheck -S error \
-            images/user/login-shell images/user/container-sshd-entrypoint images/user/bin/* \
+          bash -n status/bin/cluster-status status/sbin/cluster-status-bake status/sbin/cluster-status-announce status/etc/profile.d/zz-cluster-status.sh
+          bash -n agent-guardrails/bin/agent-guardrails agent-guardrails/etc/claude-code/update-motd.sh agent-guardrails/etc/profile.d/ai-agent-skills.sh
+          bash -n deploy/warewulf/render-overlays.sh deploy/warewulf/import-image.sh deploy/standalone/install.sh
+          shellcheck -S warning \
+            images/user/login-shell images/user/slurm-login-shell images/user/container-sshd-entrypoint images/user/bin/* \
             images/admin/admin-login-shell images/admin/admin-container-sshd-entrypoint \
             login-gateway/libexec/dispatch login-gateway/libexec/route login-gateway/libexec/spawn \
             login-gateway/libexec/stop login-gateway/libexec/classify-transfer \
+            login-gateway/etc/enroot/hooks.d/50-login-pod-hostname.sh \
             login-gateway/sbin/login-gateway-authorized-keys login-gateway/sbin/sss_ssh_authorizedkeys.filter \
-            status/bin/cluster-status status/sbin/cluster-status-bake \
-            deploy/warewulf/render-overlays.sh deploy/standalone/install.sh
+            status/bin/cluster-status status/sbin/cluster-status-bake status/sbin/cluster-status-announce \
+            agent-guardrails/bin/agent-guardrails agent-guardrails/etc/claude-code/update-motd.sh \
+            deploy/warewulf/render-overlays.sh deploy/warewulf/import-image.sh deploy/standalone/install.sh
           python3 -m py_compile login-gateway/sbin/sss_ssh_authorizedkeys.filter.py tests/*.py
+          bandit -q -ll login-gateway/sbin/sss_ssh_authorizedkeys.filter.py tests/scan_secrets_pii.py
 
       - name: 🧪 Run Python unit tests
         run: python3 -m unittest discover -v -s tests
 
-      - name: 🧪 Run BATS transfer fast-path tests
-        run: bats tests/transfer_fastpath.bats
+      - name: 🧪 Run BATS test suites
+        run: bats tests/transfer_fastpath.bats tests/hostname_hook.bats
 
   build-test:
     name: 🐳 Build & Smoke Test (User + Admin Images)
@@ -75,27 +92,35 @@ jobs:
       - name: 🛠️ Checkout Repository
         uses: actions/checkout@v4
 
-      - name: 🎯 Stage Slurm Client DEBs
+      - name: 🎯 Stage Slurm Client DEBs & Resolve Image Version
         run: |
           set -e
           git clone --depth 1 https://github.com/ualberta-rcg/warewulf-slurmd /tmp/ww
           if [ -n "${{ github.event.inputs.SLURM_VERSION_OVERRIDE }}" ]; then
-            VERSION="${{ github.event.inputs.SLURM_VERSION_OVERRIDE }}"
+            DEB_VERSION="${{ github.event.inputs.SLURM_VERSION_OVERRIDE }}"
           else
-            VERSION=$(ls /tmp/ww/slurm-debs/slurm-smd_*_amd64_u2404.deb \
+            DEB_VERSION=$(ls /tmp/ww/slurm-debs/slurm-smd_*_amd64_u2404.deb \
               | sed -E 's/.*slurm-smd_([0-9]+\.[0-9]+\.[0-9]+-[0-9]+)_amd64_u2404\.deb/\1/' \
               | sort -V | tail -n1)
           fi
-          [ -z "$VERSION" ] && { echo "::error::No DEB version resolved"; exit 1; }
-          echo "Testing against Slurm $VERSION"
+          [ -z "$DEB_VERSION" ] && { echo "::error::No DEB version resolved"; exit 1; }
+          IMAGE_TAG="$DEB_VERSION"
+          if [ -s IMAGE_RELEASE ]; then
+            PIN_REL=$(tr -d '[:space:]' < IMAGE_RELEASE)
+            if [ "${PIN_REL%-*}" = "${DEB_VERSION%-*}" ]; then
+              IMAGE_TAG="$PIN_REL"
+            fi
+          fi
+          echo "Staging Slurm DEBs $DEB_VERSION -> image tag $IMAGE_TAG"
           mkdir -p debs
-          cp /tmp/ww/slurm-debs/*_${VERSION}_*_u2404.deb debs/
-          echo "version=$VERSION" >> $GITHUB_ENV
+          cp /tmp/ww/slurm-debs/*_${DEB_VERSION}_*_u2404.deb debs/
+          echo "deb_version=$DEB_VERSION" >> $GITHUB_ENV
+          echo "image_tag=$IMAGE_TAG" >> $GITHUB_ENV
 
       - name: 🐳 Build User Image
         run: |
           set -o pipefail
-          docker build -f images/user/Dockerfile --build-arg IMAGE_VERSION="${{ env.version }}" -t slp:user . 2>&1 | tee /tmp/build.log || {
+          docker build -f images/user/Dockerfile --build-arg IMAGE_VERSION="${{ env.image_tag }}" -t slp:user . 2>&1 | tee /tmp/build.log || {
             echo "::error::user build failed: $(grep -vE '^ #[0-9]+ \[|^ *[0-9]+ \||^>>>|^ ---$' /tmp/build.log | tail -n8 | tr '\n' ' ' | cut -c1-800)"
             exit 1
           }
@@ -113,28 +138,25 @@ jobs:
           }
           printf 'ClusterName=slptest\nSlurmctldHost=localhost(127.0.0.1)\nPlugStackConfig=/etc/slurm/plugstack.conf\n' > test-slurm.conf
           CONFMNT="-v $PWD/test-slurm.conf:/etc/slurm/slurm.conf:ro"
-          check "containment sentinel" docker run --rm --entrypoint test slp:user -s /etc/slurm-login-pods-release
-          check "srun --version"       docker run --rm $CONFMNT --entrypoint srun slp:user --version
-          check "sbatch --version"     docker run --rm $CONFMNT --entrypoint sbatch slp:user --version
-          check "scontrol version"     docker run --rm $CONFMNT --entrypoint scontrol slp:user version
-          check "login-shell present"  docker run --rm --entrypoint test slp:user -x /usr/local/bin/login-shell
-          check "sshd-entry present"   docker run --rm --entrypoint test slp:user -x /usr/local/bin/container-sshd-entrypoint
-          check "sftp-server symlink"  docker run --rm --entrypoint bash slp:user -c 'test -L /usr/libexec/openssh/sftp-server && test -x /usr/libexec/openssh/sftp-server'
-          check "sq + login-pod PATH"  docker run --rm --entrypoint bash slp:user -lc 'command -v sq && command -v login-pod && command -v seff && command -v diskusage_report'
-          check "cluster-status"       docker run --rm --entrypoint bash slp:user -lc 'cluster-status --plain --only header'
-          check "guardrails baked"     docker run --rm --entrypoint bash slp:user -c 'test -s /etc/claude-code/CLAUDE.md && test -s /etc/claude-code/managed-settings.json && test -d /etc/claude-code/.claude/skills/alliance-slurm && test -s /etc/agents/AGENTS.md'
-          check "no baked hostkeys"    docker run --rm --entrypoint bash slp:user -c 'ls /etc/ssh/ssh_host_* >/dev/null 2>&1 && exit 1 || exit 0'
-          check "no slurmd/slurmctld"  docker run --rm --entrypoint bash slp:user -c 'test ! -x /usr/sbin/slurmd && test ! -x /usr/sbin/slurmctld'
+          check "containment sentinel" docker run --rm --entrypoint bash slp:user -c 'grep -q "${{ env.image_tag }}" /etc/slurm-login-pods-release'
+          check "srun/sbatch/scontrol" docker run --rm $CONFMNT --entrypoint bash slp:user -c 'srun --version && sbatch --version && scontrol version'
+          check "entrypoints + sftp"   docker run --rm --entrypoint bash slp:user -c 'test -x /usr/local/bin/login-shell && test -x /usr/local/bin/container-sshd-entrypoint && test -L /usr/libexec/openssh/sftp-server && test -x /usr/libexec/openssh/sftp-server'
+          check "GatewayPorts no"      docker run --rm --entrypoint bash slp:user -c 'grep -q "^GatewayPorts no$" /usr/local/bin/container-sshd-entrypoint'
+          check "status + PATH"        docker run --rm --entrypoint bash slp:user /usr/local/bin/login-shell -c 'echo "$PATH" | grep -q "/etc/cluster-status/bin" && cluster-status --plain --only header && /usr/local/sbin/cluster-status-announce --help'
+          check "7 AI agent CLIs"      docker run --rm --entrypoint bash slp:user -lc 'node --version | grep -q "^v22\." && claude --version && codex --version && opencode --version && gemini --version && pi --version && cursor-agent --version && agy --version'
+          check "guardrails + skills"  docker run --rm --entrypoint bash slp:user -c 'test -s /etc/claude-code/CLAUDE.md && test -s /etc/claude-code/managed-settings.json && test -s /etc/codex/requirements.toml && test -s /etc/gemini-cli/policies/hpc-guardrails.toml && test -s /etc/pi/extensions/hpc-guardrails.ts && HOME=/tmp/thome mkdir -p /tmp/thome && HOME=/tmp/thome agent-guardrails link && HOME=/tmp/thome agent-guardrails status && test "$(agent-guardrails list-community | wc -l)" -ge 10'
+          check "user dev/HPC tools"   docker run --rm --entrypoint bash slp:user -lc 'uv --version && gh --version && globus version && sqlite3 --version && h5dump --version && command -v ncdump && direnv version && shellcheck --version && hyperfine --version && command -v entr && tig --version && mc --version && /usr/bin/time --version && test -e /etc/bash_completion.d/slurm'
+          check "nmap removed in user" docker run --rm --entrypoint bash slp:user -c '! command -v nmap'
+          check "no hostkeys/daemons"  docker run --rm --entrypoint bash slp:user -c 'test ! -x /usr/sbin/slurmd && test ! -x /usr/sbin/slurmctld && (ls /etc/ssh/ssh_host_* >/dev/null 2>&1 && exit 1 || exit 0)'
           check "login-shell scrub"    docker run --rm -e SLURM_JOB_ID=12345 -e SLURM_CONF=/run/slurm/conf --entrypoint bash slp:user \
             /usr/local/bin/login-shell -c 'test -z "${SLURM_JOB_ID:-}" && test "$LOGIN_POD_JOB_ID" = "12345" && test "$SLURM_CONF" = "/run/slurm/conf/slurm.conf"'
           check "pyxis registered"     docker run --rm $CONFMNT --entrypoint bash slp:user -c 'srun --help 2>&1 | grep -c -- "--container" | grep -qv ^0'
-          check "claude + cvmfs"       docker run --rm --entrypoint bash slp:user -c 'command -v claude && command -v cvmfs_config'
-          echo "✅ All user image smoke tests passed (Slurm ${{ env.version }})"
+          echo "✅ All user image smoke tests passed (${{ env.image_tag }})"
 
       - name: 🐳 Build Admin Image
         run: |
           set -o pipefail
-          docker build -f images/admin/Dockerfile --build-arg IMAGE_VERSION="${{ env.version }}" -t slp:admin . 2>&1 | tee /tmp/admin-build.log || {
+          docker build -f images/admin/Dockerfile --build-arg IMAGE_VERSION="${{ env.image_tag }}" -t slp:admin . 2>&1 | tee /tmp/admin-build.log || {
             echo "::error::admin build failed: $(grep -vE '^ #[0-9]+ \[|^ *[0-9]+ \||^>>>|^ ---$' /tmp/admin-build.log | tail -n8 | tr '\n' ' ' | cut -c1-800)"
             exit 1
           }
@@ -150,12 +172,25 @@ jobs:
               exit 1
             fi
           }
-          check "containment sentinel" docker run --rm --entrypoint test slp:admin -s /etc/slurm-login-pods-release
-          check "admin sshd entry"     docker run --rm --entrypoint test slp:admin -x /usr/local/bin/admin-container-sshd-entrypoint
-          check "admin login shell"    docker run --rm --entrypoint test slp:admin -x /usr/local/bin/admin-login-shell
-          check "sftp-server symlink"  docker run --rm --entrypoint bash slp:admin -c 'test -L /usr/libexec/openssh/sftp-server && test -x /usr/libexec/openssh/sftp-server'
-          check "sudo+su+sshd"         docker run --rm --entrypoint bash slp:admin -lc 'command -v sudo >/dev/null && command -v su >/dev/null && command -v sshd >/dev/null && command -v cluster-status >/dev/null'
-          check "pam_sss"              docker run --rm --entrypoint bash slp:admin -c 'find /lib /usr/lib -name pam_sss.so | grep -q pam_sss'
-          check "admin sudoers"        docker run --rm --entrypoint bash slp:admin -c 'test -f /etc/sudoers.d/gateway-admins && visudo -cf /etc/sudoers.d/gateway-admins'
+          check "containment sentinel" docker run --rm --entrypoint bash slp:admin -c 'grep -q "${{ env.image_tag }}" /etc/slurm-login-pods-release'
+          check "admin entrypoints"    docker run --rm --entrypoint bash slp:admin -c 'test -x /usr/local/bin/admin-container-sshd-entrypoint && test -x /usr/local/bin/admin-login-shell && grep -q "^GatewayPorts no$" /usr/local/bin/admin-container-sshd-entrypoint'
+          check "sudo+su+pam_sss"      docker run --rm --entrypoint bash slp:admin -lc 'command -v sudo && command -v su && command -v sshd && find /lib /usr/lib -name pam_sss.so | grep -q pam_sss && visudo -cf /etc/sudoers.d/gateway-admins'
+          check "7 AI agent CLIs"      docker run --rm --entrypoint bash slp:admin -lc 'node --version | grep -q "^v22\." && claude --version && codex --version && opencode --version && gemini --version && pi --version && cursor-agent --version && agy --version'
+          check "admin unrestricted"   docker run --rm --entrypoint bash slp:admin -c 'test ! -e /etc/claude-code/managed-settings.json && test ! -e /etc/codex/requirements.toml && test ! -d /etc/gemini-cli/policies && test ! -e /etc/pi/extensions/hpc-guardrails.ts && test ! -e /etc/cursor/cli-config.json && LOGIN_SESSION_MODE=admin LOGIN_GUARDRAILS_ENABLED=0 agent-guardrails status | grep -q "admin unrestricted"'
+          check "admin k8s/cloud/IaC"  docker run --rm --entrypoint bash slp:admin -lc 'kubectl version --client && helm version && k9s version && stern --version && ansible --version && ansible-lint --version && tofu --version && aws --version && s5cmd version && openstack --version && gh --version && glab --version && restic version'
+          check "admin hw/net/db/perf" docker run --rm --entrypoint bash slp:admin -lc 'clush --version && ipmitool -V && ipmi-sensors --version && dmidecode --version && lshw -version && smartctl --version && (nvme --version || nvme version) && ethtool --version && command -v lldpcli && (ldapsearch -VV 2>&1 | grep -qi openldap) && munge --version && nmap --version && tcpdump --version && iperf3 --version && http --version && conntrack --version && nft --version && mariadb --version && psql --version && redis-cli --version && bpftrace --version && perf --version && atop -V && (command -v sos || command -v sosreport)'
           check "no baked hostkeys"    docker run --rm --entrypoint bash slp:admin -c 'ls /etc/ssh/ssh_host_* >/dev/null 2>&1 && exit 1 || exit 0'
-          echo "✅ Admin image smoke tests passed"
+          echo "✅ All admin image smoke tests passed (${{ env.image_tag }})"
+
+      - name: 🛡️ Trivy Vulnerability Summary (report-only)
+        run: |
+          if curl -fsSL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin; then
+            {
+              echo "### Trivy Summary (HIGH/CRITICAL, report-only)"
+              echo '```text'
+              trivy image --quiet --severity HIGH,CRITICAL --exit-code 0 slp:user | tail -n 30 || true
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Trivy download skipped (upstream mirror unavailable)" >> "$GITHUB_STEP_SUMMARY"
+          fi

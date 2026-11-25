@@ -178,9 +178,13 @@ if (( PORT < BASE_PORT || PORT > 60000 )) || port_in_use "$PORT"; then
     done
 fi
 
-SETENV_LINE="XAUTHORITY=/tmp/sshd/.Xauthority XDG_RUNTIME_DIR=${RUNTIME_DIR} CLUSTER_STATUS_CACHE_DIR=${STATUS_CACHE_DIR} LOGIN_JOB_ID=${JOB_ID} LOGIN_POD_NODE=${NODE} LOGIN_SESSION_MODE=${SESSION_MODE} CC_CLUSTER=${CLUSTER_NAME} LOGIN_STATUS_ENABLED=${EFFECTIVE_STATUS} LOGIN_GUARDRAILS_ENABLED=${EFFECTIVE_GUARDRAILS} OMPI_MCA_rmaps_base_oversubscribe=1"
+POD_DEFAULT_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/etc/cluster-status/bin"
+SETENV_LINE="PATH=${POD_DEFAULT_PATH} XAUTHORITY=/tmp/sshd/.Xauthority XDG_RUNTIME_DIR=${RUNTIME_DIR} CLUSTER_STATUS_CACHE_DIR=${STATUS_CACHE_DIR} LOGIN_JOB_ID=${JOB_ID} LOGIN_POD_NODE=${NODE} LOGIN_SESSION_MODE=${SESSION_MODE} CC_CLUSTER=${CLUSTER_NAME} LOGIN_STATUS_ENABLED=${EFFECTIVE_STATUS} LOGIN_GUARDRAILS_ENABLED=${EFFECTIVE_GUARDRAILS} OMPI_MCA_rmaps_base_oversubscribe=1"
 if [[ -n "$RESOLVED_SLURM_CONF" ]]; then
     SETENV_LINE="${SETENV_LINE} SLURM_CONF=${RESOLVED_SLURM_CONF}"
+fi
+if [[ "$SESSION_MODE" != "robot" && -n "${LOGIN_GATEWAY_ANNOUNCE_PATH:-${CLUSTER_STATUS_ANNOUNCE:-}}" ]]; then
+    SETENV_LINE="${SETENV_LINE} CLUSTER_STATUS_ANNOUNCE=${LOGIN_GATEWAY_ANNOUNCE_PATH:-${CLUSTER_STATUS_ANNOUNCE}}"
 fi
 
 # 6. Write non-root in-container sshd_config in /tmp/sshd
@@ -210,7 +214,7 @@ XAuthLocation ${SSHD_DIR}/xauth-wrapper.sh
 AllowTcpForwarding yes
 AllowStreamLocalForwarding yes
 AllowAgentForwarding yes
-GatewayPorts clientspecified
+GatewayPorts no
 Subsystem sftp internal-sftp
 LogLevel INFO
 EOF
@@ -223,7 +227,7 @@ PUB_B64=$(awk '{print $2}' "${SSHD_DIR}/ssh_host_ed25519_key.pub")
 
 # 8. Start sshd in a scrubbed environment
 ENV_ARGS=(
-    PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    PATH="${POD_DEFAULT_PATH}"
     HOME="${HOME:-/home/${USER_NAME}}"
     USER="${USER_NAME}"
     LOGNAME="${USER_NAME}"
@@ -292,9 +296,13 @@ cleanup_children() {
 }
 trap cleanup_children EXIT
 
-# 12. Pre-configure tmux server for interactive login pods (skipped for robot pods)
+# 12. Link agent skills & guardrails into $HOME (covers VS Code, ssh host cmd, OOD) + warm tmux
 export TMPDIR=/tmp
 if [[ "$SESSION_MODE" != "robot" ]]; then
+    if [[ "$EFFECTIVE_GUARDRAILS" == "1" && -x /usr/local/bin/agent-guardrails ]]; then
+        LOGIN_SESSION_MODE="$SESSION_MODE" LOGIN_GUARDRAILS_ENABLED="$EFFECTIVE_GUARDRAILS" \
+            /usr/local/bin/agent-guardrails link >/dev/null 2>&1 || true
+    fi
     tmux start-server \; set-option -g exit-empty off 2>/dev/null || true
 fi
 touch /tmp/.login_container_ready

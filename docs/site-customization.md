@@ -35,7 +35,8 @@ All hooks are optional executables (`0755`, `root:root`, never group/world-writa
   ```
 - `/etc/cluster-status/logo.txt`: Plain-text ASCII art logo.
 - `/etc/cluster-status/links.txt`: `Label:|https://url` lines (`Support:`, `Documentation:`, `Portal:`, `Open OnDemand:`).
-- `/etc/cluster-status/announce.txt`: Live maintenance/incident banner (hidden automatically when empty).
+- `/etc/cluster-status/bin/<mycluster>-status`: Symlink to `/usr/local/bin/cluster-status`. `/etc/cluster-status/bin` is placed on `PATH` in login shells, pod `sshd` `SetEnv`, and `login-shell`, so the site status command works in both interactive terminals and non-interactive AI agent tool calls.
+- **Pass-in announcements (`ANNOUNCE` / `STATUS_ANNOUNCE_PATH`):** Point `STATUS_ANNOUNCE_PATH` in `login-gateway.conf` (and `ANNOUNCE` in `motd.conf`) to a shared file or drop-in directory (e.g. `/cache/cluster-status/announce.d`). `spawn` bind-mounts it read-only into every `login-*` and `admin-*` pod, and operators can post/expire/clear notices live without rebuilding overlays using `cluster-status-announce set --expires "YYYY-MM-DD HH:MM" "..."` or `cluster-status-announce clear`.
 
 ## 4. AI Agent Cluster Notes (`/etc/agents/site.md`)
 
