@@ -16,13 +16,15 @@ IMAGE_PATH="/cache/slurm-login-pods.sqsh"
 
 # Interactive user pod sizing (login-<username>)
 LOGIN_CPUS="4"
-LOGIN_MEM="4G"
+LOGIN_MEM="8G"
 LOGIN_WALLTIME="7-00:00:00"
 
-# Request --oversubscribe for login/robot pods and prefer spawning on the local
-# gateway host when it has free capacity in LOGIN_PARTITION (falls back automatically).
+# Request --oversubscribe for pods (set "0" when sharing nodes with non-oversubscribed
+# compute partitions) and prefer spawning on the local gateway host when it has free
+# capacity in LOGIN_PARTITION. Optional EXCLUDE_NODES="-x" list keeps pure gateways free.
 POD_OVERSUBSCRIBE="1"
 PREFER_LOCAL_NODE="1"
+EXCLUDE_NODES=""
 
 # Seconds to wait for a cold Slurm pod allocation to become ready
 WAIT_TIMEOUT="60"

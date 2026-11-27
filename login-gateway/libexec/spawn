@@ -67,6 +67,7 @@ AGENT_GUARDRAILS_ENABLED="${AGENT_GUARDRAILS_ENABLED:-1}"
 ADMIN_AGENT_GUARDRAILS="${ADMIN_AGENT_GUARDRAILS:-0}"
 POD_OVERSUBSCRIBE="${POD_OVERSUBSCRIBE:-1}"
 PREFER_LOCAL_NODE="${PREFER_LOCAL_NODE:-1}"
+EXCLUDE_NODES="${EXCLUDE_NODES:-}"
 POD_HOSTNAME_TEMPLATE="${POD_HOSTNAME_TEMPLATE-%c-%m-%u}"
 
 if [[ "$MODE" == "robot" ]]; then
@@ -342,6 +343,8 @@ MOUNTS=$(build_mounts)
 NODE_ARG=""
 if [[ -n "$TARGET_NODE" ]]; then
     NODE_ARG="-w ${TARGET_NODE}"
+elif [[ -n "$EXCLUDE_NODES" ]]; then
+    NODE_ARG="-x ${EXCLUDE_NODES}"
 elif [[ "$PREFER_LOCAL_NODE" == "1" ]]; then
     LOCAL_HOST=$(hostname -s 2>/dev/null || true)
     REQ_MEM_MB=$(mem_to_mb "$MEM")
@@ -351,7 +354,7 @@ elif [[ "$PREFER_LOCAL_NODE" == "1" ]]; then
 fi
 
 SALLOC_EXTRA_FLAGS=""
-if [[ "$POD_OVERSUBSCRIBE" == "1" && "$MODE" != "admin" ]]; then
+if [[ "$POD_OVERSUBSCRIBE" == "1" ]]; then
     SALLOC_EXTRA_FLAGS="--oversubscribe"
 fi
 
